@@ -1,0 +1,17 @@
+[package]
+name = "vtile-core"
+description = "Mapbox Vector Tile (MVT v2) generation engine: tile math, protobuf encoding, simplification, tile assembly"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+geo = { workspace = true }
+geo-types = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+flate2 = { workspace = true }
+rayon = { workspace = true }
+tracing = { workspace = true }
