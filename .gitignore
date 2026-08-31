@@ -1,0 +1,6 @@
+/target
+**/*.rs.bk
+.env
+.DS_Store
+# Local runtime data (uploads, tiles, jobs) created by the dev server
+/data

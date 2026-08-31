@@ -1,0 +1,61 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/vtile-core",
+    "crates/vtile-ingest",
+    "crates/vtile-pipeline",
+    "crates/vtile-api",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+repository = "https://example.com/cre/vector-tile"
+
+[workspace.dependencies]
+# Internal crates
+vtile-core = { path = "crates/vtile-core" }
+vtile-ingest = { path = "crates/vtile-ingest" }
+vtile-pipeline = { path = "crates/vtile-pipeline" }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Geospatial
+geo = "0.28"
+geo-types = "0.7"
+geojson = { version = "0.24", features = ["geo-types"] }
+
+# Errors / logging
+thiserror = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Async / web
+tokio = { version = "1", features = ["full"] }
+axum = "0.7"
+tower-http = { version = "0.5", features = ["cors", "trace", "limit"] }
+http = "1"
+
+# Compression / hashing / ids
+flate2 = "1"
+sha2 = "0.10"
+hex = "0.4"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+zip = "2"
+rayon = "1"
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+
+# AWS (optional, behind the `aws` feature of vtile-pipeline)
+aws-config = "1"
+aws-sdk-s3 = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
