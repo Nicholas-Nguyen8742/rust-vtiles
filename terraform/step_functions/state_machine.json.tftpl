@@ -1,0 +1,215 @@
+{
+  "Comment": "Vector tile ingestion pipeline (TRD §10). Each ECS state runs the vtile CLI on Fargate with per-step subcommands. Retries use exponential backoff 30s/60s/120s (US-06) before routing to the failure path.",
+  "StartAt": "ValidateAndNormalize",
+  "States": {
+    "ValidateAndNormalize": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::ecs:runTask.sync",
+      "Parameters": {
+        "Cluster": "${cluster_arn}",
+        "TaskDefinition": "${task_definition_arn}",
+        "LaunchType": "FARGATE",
+        "NetworkConfiguration": {
+          "AwsvpcConfiguration": {
+            "AssignPublicIp": "ENABLED",
+            "SecurityGroups": "${jsonencode(security_group_ids)}",
+            "Subnets": "${jsonencode(subnet_ids)}"
+          }
+        },
+        "Overrides": {
+          "ContainerOverrides": [
+            {
+              "Name": "${container_name}",
+              "Command.$": "States.Array('vtile', 'run', '--step', 'normalize', '--job-id', $.jobId)"
+            }
+          ]
+        }
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "IntervalSeconds": 30,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "EmitFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "GenerateTiles"
+    },
+    "GenerateTiles": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::ecs:runTask.sync",
+      "Parameters": {
+        "Cluster": "${cluster_arn}",
+        "TaskDefinition": "${task_definition_arn}",
+        "LaunchType": "FARGATE",
+        "NetworkConfiguration": {
+          "AwsvpcConfiguration": {
+            "AssignPublicIp": "ENABLED",
+            "SecurityGroups": "${jsonencode(security_group_ids)}",
+            "Subnets": "${jsonencode(subnet_ids)}"
+          }
+        },
+        "Overrides": {
+          "ContainerOverrides": [
+            {
+              "Name": "${container_name}",
+              "Command.$": "States.Array('vtile', 'run', '--step', 'tile', '--job-id', $.jobId)"
+            }
+          ]
+        }
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "IntervalSeconds": 30,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "EmitFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "PublishTiles"
+    },
+    "PublishTiles": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::ecs:runTask.sync",
+      "Parameters": {
+        "Cluster": "${cluster_arn}",
+        "TaskDefinition": "${task_definition_arn}",
+        "LaunchType": "FARGATE",
+        "NetworkConfiguration": {
+          "AwsvpcConfiguration": {
+            "AssignPublicIp": "ENABLED",
+            "SecurityGroups": "${jsonencode(security_group_ids)}",
+            "Subnets": "${jsonencode(subnet_ids)}"
+          }
+        },
+        "Overrides": {
+          "ContainerOverrides": [
+            {
+              "Name": "${container_name}",
+              "Command.$": "States.Array('vtile', 'run', '--step', 'publish', '--job-id', $.jobId)"
+            }
+          ]
+        }
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "IntervalSeconds": 30,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "EmitFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "UpdateCatalog"
+    },
+    "UpdateCatalog": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::ecs:runTask.sync",
+      "Parameters": {
+        "Cluster": "${cluster_arn}",
+        "TaskDefinition": "${task_definition_arn}",
+        "LaunchType": "FARGATE",
+        "NetworkConfiguration": {
+          "AwsvpcConfiguration": {
+            "AssignPublicIp": "ENABLED",
+            "SecurityGroups": "${jsonencode(security_group_ids)}",
+            "Subnets": "${jsonencode(subnet_ids)}"
+          }
+        },
+        "Overrides": {
+          "ContainerOverrides": [
+            {
+              "Name": "${container_name}",
+              "Command.$": "States.Array('vtile', 'run', '--step', 'catalog', '--job-id', $.jobId)"
+            }
+          ]
+        }
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "IntervalSeconds": 30,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "EmitFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "EmitCompletion"
+    },
+    "EmitCompletion": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::events:putEvents",
+      "Parameters": {
+        "Entries": [
+          {
+            "Source": "geo",
+            "DetailType": "vector.tile.job.completed",
+            "Detail.$": "States.JsonToString($)"
+          }
+        ]
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "IntervalSeconds": 10,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "End": true
+    },
+    "EmitFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::events:putEvents",
+      "Parameters": {
+        "Entries": [
+          {
+            "Source": "geo",
+            "DetailType": "vector.tile.job.failed",
+            "Detail.$": "States.JsonToString($)"
+          }
+        ]
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "IntervalSeconds": 10,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Next": "JobFailed"
+    },
+    "JobFailed": {
+      "Type": "Fail",
+      "Error": "VECTOR_TILE_JOB_FAILED",
+      "Cause": "Tile ingestion failed after retries. Inspect the DLQ and Step Functions execution history."
+    }
+  }
+}
