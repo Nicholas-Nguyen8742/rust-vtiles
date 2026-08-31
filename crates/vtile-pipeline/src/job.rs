@@ -1,0 +1,320 @@
+//! End-to-end job runner implementing the TRD §10 workflow states.
+//!
+//! In AWS, Step Functions invokes the `vtile` binary per state; `run_job`
+//! executes the same states in-process for local/dev runs.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use chrono::Utc;
+use tracing::{info, instrument};
+
+use vtile_core::config::TileConfig;
+use vtile_core::model::{
+    Bbox, JobOutcomeSummary, JobRecord, JobStatus, LayerMetadata, SecurityClassification,
+};
+use vtile_core::sink::TileObjectMeta;
+use vtile_core::tileset::{generate_tiles, prepare_features, RawFeature, TileStats};
+use vtile_ingest::normalize::{
+    normalize_source, write_normalized_geojson, NormalizeOptions, SourceFile,
+};
+
+use crate::error::{PipelineError, PipelineResult};
+use crate::events::{EventEmitter, PipelineEvent};
+use crate::manifest::TileManifest;
+use crate::sink_local::LocalTileSink;
+use crate::store::{JobStore, LayerCatalog};
+
+/// Filesystem layout roots for one job (mirrors TRD §6 S3 prefixes).
+#[derive(Debug, Clone)]
+pub struct JobPaths {
+    /// `staging/{tenantId}/{jobId}/`
+    pub staging_root: PathBuf,
+    /// `tiles/{tenantId}/{layerId}/`
+    pub tiles_root: PathBuf,
+    /// `manifests/{tenantId}/{layerId}/`
+    pub manifests_root: PathBuf,
+}
+
+impl JobPaths {
+    pub fn normalized_artifact(&self) -> PathBuf {
+        self.staging_root.join("normalized.geojson")
+    }
+
+    pub fn manifest_path(&self) -> PathBuf {
+        self.manifests_root.join("manifest.json")
+    }
+}
+
+/// Shared services for a run.
+pub struct JobDeps {
+    pub jobs: Arc<dyn JobStore>,
+    pub catalog: Arc<dyn LayerCatalog>,
+    pub events: Arc<dyn EventEmitter>,
+}
+
+/// Everything needed to run one job.
+pub struct RunJobInput {
+    pub job: JobRecord,
+    pub source_bytes: Vec<u8>,
+    pub tile_config: TileConfig,
+    pub normalize_opts: NormalizeOptions,
+    pub paths: JobPaths,
+}
+
+/// Outcome of a successful run.
+#[derive(Debug)]
+pub struct JobOutcome {
+    pub feature_count: u64,
+    pub tile_count: u64,
+    pub bbox: Bbox,
+    pub tile_version: String,
+    pub manifest: TileManifest,
+    pub stats: TileStats,
+    pub warnings: Vec<String>,
+}
+
+/// Runs the full workflow: validate → normalize → tile → publish → catalog →
+/// event. Job status transitions are persisted through the [`JobStore`].
+#[instrument(skip_all, fields(job_id = %input.job.job_id, layer = %input.job.layer_id))]
+pub fn run_job(input: &RunJobInput, deps: &JobDeps) -> PipelineResult<JobOutcome> {
+    let job = &input.job;
+
+    // TRD §14 reliability: idempotent job processing using jobId.
+    if let Some(existing) = deps.jobs.get(&job.job_id)? {
+        if existing.status == JobStatus::Completed {
+            return Err(PipelineError::Job(format!(
+                "job {} already completed (idempotency guard)",
+                job.job_id
+            )));
+        }
+    }
+
+    match run_job_inner(input, deps) {
+        Ok(outcome) => Ok(outcome),
+        Err(err) => {
+            let (code, message) = error_classification(&err);
+            let _ = deps.jobs.update_status(&job.job_id, JobStatus::Failed, Some(message.clone()));
+            deps.events.emit(PipelineEvent::VectorTileJobFailed {
+                event_id: new_event_id(),
+                tenant_id: job.tenant_id.clone(),
+                job_id: job.job_id.clone(),
+                error_code: code,
+                error_message: message,
+                occurred_at: Utc::now(),
+            });
+            Err(err)
+        }
+    }
+}
+
+fn run_job_inner(input: &RunJobInput, deps: &JobDeps) -> PipelineResult<JobOutcome> {
+    let job = &input.job;
+    let paths = &input.paths;
+    let mut warnings: Vec<String> = Vec::new();
+
+    // ── 1. Validate upload ────────────────────────────────────────────────
+    deps.jobs.update_status(&job.job_id, JobStatus::Validating, None)?;
+    if !job.source_format.is_supported_in_mvp() {
+        return Err(PipelineError::Job(format!(
+            "source format {:?} not supported in MVP",
+            job.source_format
+        )));
+    }
+
+    // ── 2–7. Detect format → unpack → CRS/geometry validation → normalize ─
+    deps.jobs.update_status(&job.job_id, JobStatus::Normalizing, None)?;
+    let source = match job.source_format {
+        vtile_core::model::SourceFormat::GeoJson => SourceFile::GeoJson {
+            bytes: input.source_bytes.clone(),
+        },
+        vtile_core::model::SourceFormat::Shapefile => SourceFile::ShapefileZip {
+            bytes: input.source_bytes.clone(),
+        },
+        other => return Err(PipelineError::Job(format!("unsupported format {other:?}"))),
+    };
+    let dataset = normalize_source(source, &input.normalize_opts)?;
+    warnings.extend(dataset.warnings.iter().cloned());
+    info!(
+        features = dataset.feature_count(),
+        rejected = dataset.rejected_features,
+        crs = dataset.crs.label(),
+        "normalization complete"
+    );
+
+    // ── 5. Write normalized artifact ──────────────────────────────────────
+    fs::create_dir_all(&paths.staging_root)?;
+    let normalized_json = write_normalized_geojson(&dataset);
+    fs::write(paths.normalized_artifact(), serde_json::to_string(&normalized_json)?)?;
+
+    let Some(bbox) = dataset.bbox else {
+        return Err(PipelineError::Job("normalized dataset has no coordinates".into()));
+    };
+
+    // ── 8. Generate vector tiles ──────────────────────────────────────────
+    deps.jobs.update_status(&job.job_id, JobStatus::Tiling, None)?;
+    let tile_version = new_tile_version();
+    let raw_features: Vec<RawFeature> = dataset
+        .features
+        .iter()
+        .map(|f| RawFeature {
+            id: f.id,
+            geometry: f.geometry.clone(),
+            properties: f.properties.clone(),
+        })
+        .collect();
+    let prepared = prepare_features(raw_features, &input.tile_config);
+    if prepared.feature_count() == 0 {
+        return Err(PipelineError::Job("no tileable features after preparation".into()));
+    }
+
+    let sink_root = paths.tiles_root.join(&tile_version);
+    let sink = LocalTileSink::new(&sink_root);
+    let meta = TileObjectMeta {
+        tenant_id: job.tenant_id.clone(),
+        layer_id: job.layer_id.clone(),
+        tile_version: tile_version.clone(),
+        source_format: job.source_format.as_str().to_string(),
+        crs: "EPSG:4326".to_string(),
+        min_zoom: input.tile_config.zoom_range.min_zoom,
+        max_zoom: input.tile_config.zoom_range.max_zoom,
+    };
+    let stats = generate_tiles(&prepared, &input.tile_config, &meta, &sink)?;
+    info!(
+        tiles = stats.tiles_written,
+        gzip_bytes = stats.total_gzip_bytes,
+        ms = stats.elapsed_ms,
+        "tile generation complete"
+    );
+
+    // ── 9/10. Publish tiles + write manifest ──────────────────────────────
+    deps.jobs.update_status(&job.job_id, JobStatus::Publishing, None)?;
+    let manifest = TileManifest {
+        schema_version: crate::manifest::MANIFEST_SCHEMA_VERSION,
+        tenant_id: job.tenant_id.clone(),
+        layer_id: job.layer_id.clone(),
+        tile_version: tile_version.clone(),
+        min_zoom: input.tile_config.zoom_range.min_zoom,
+        max_zoom: input.tile_config.zoom_range.max_zoom,
+        tile_count: stats.tiles_written,
+        total_gzip_bytes: stats.total_gzip_bytes,
+        bounding_box: bbox,
+        generated_at: Utc::now(),
+        tile_url_template: None,
+    };
+    fs::create_dir_all(&paths.manifests_root)?;
+    fs::write(paths.manifest_path(), manifest.to_json()?)?;
+
+    // ── 11. Update catalog ────────────────────────────────────────────────
+    let layer_input = job.layer_input.clone().unwrap_or_default();
+    let category = layer_input
+        .category
+        .unwrap_or(vtile_core::model::LayerCategory::Other);
+    let layer_meta = LayerMetadata {
+        layer_id: job.layer_id.clone(),
+        tenant_id: job.tenant_id.clone(),
+        name: layer_input
+            .name
+            .unwrap_or_else(|| job.layer_id.clone()),
+        description: layer_input.description,
+        category,
+        source_format: job.source_format,
+        crs: "EPSG:4326".to_string(),
+        geometry_type: prepared.geometry_kind,
+        feature_count: prepared.feature_count(),
+        bounding_box: bbox,
+        min_zoom: input.tile_config.zoom_range.min_zoom,
+        max_zoom: input.tile_config.zoom_range.max_zoom,
+        tags: layer_input.tags,
+        security_classification: SecurityClassification::Internal,
+        published_at: Some(Utc::now()),
+        tile_version: tile_version.clone(),
+        assumed_crs: dataset.crs.assumed,
+    };
+    deps.catalog.upsert(layer_meta)?;
+
+    // ── 12. Emit completion event + finalize job ──────────────────────────
+    deps.events.emit(PipelineEvent::VectorTileJobCompleted {
+        event_id: new_event_id(),
+        tenant_id: job.tenant_id.clone(),
+        job_id: job.job_id.clone(),
+        layer_id: job.layer_id.clone(),
+        feature_count: prepared.feature_count(),
+        tile_count: stats.tiles_written,
+        min_zoom: input.tile_config.zoom_range.min_zoom,
+        max_zoom: input.tile_config.zoom_range.max_zoom,
+        tile_version: tile_version.clone(),
+        occurred_at: Utc::now(),
+    });
+
+    let mut completed = job.clone();
+    completed.status = JobStatus::Completed;
+    completed.updated_at = Utc::now();
+    completed.outcome = Some(JobOutcomeSummary {
+        feature_count: prepared.feature_count(),
+        published_tile_count: stats.tiles_written,
+        bounding_box: bbox,
+        tile_version: tile_version.clone(),
+        completed_at: Utc::now(),
+    });
+    deps.jobs.upsert(completed)?;
+
+    Ok(JobOutcome {
+        feature_count: prepared.feature_count(),
+        tile_count: stats.tiles_written,
+        bbox,
+        tile_version,
+        manifest,
+        stats,
+        warnings,
+    })
+}
+
+/// Maps errors onto the TRD error-code vocabulary used in `job.failed`
+/// events and API responses.
+pub fn error_classification(err: &PipelineError) -> (String, String) {
+    let code = match err {
+        PipelineError::Ingest(e) => match e {
+            vtile_ingest::IngestError::InvalidShapefile(_) => "INVALID_SHAPEFILE",
+            vtile_ingest::IngestError::InvalidGeoJson(_) => "INVALID_GEOJSON",
+            vtile_ingest::IngestError::EmptyDataset(_) => "EMPTY_DATASET",
+            vtile_ingest::IngestError::PayloadTooLarge { .. } => "PAYLOAD_TOO_LARGE",
+            vtile_ingest::IngestError::UnsupportedCrs(_) => "UNSUPPORTED_CRS",
+            vtile_ingest::IngestError::UnknownCrs(_) => "UNKNOWN_CRS",
+            vtile_ingest::IngestError::GeometryErrors { .. } => "GEOMETRY_ERRORS",
+            vtile_ingest::IngestError::Zip(_) => "INVALID_SHAPEFILE",
+            _ => "INGEST_FAILED",
+        },
+        PipelineError::Tile(_) => "TILE_GENERATION_FAILED",
+        PipelineError::Store(_) => "STORE_ERROR",
+        _ => "PIPELINE_ERROR",
+    };
+    (code.to_string(), err.to_string())
+}
+
+/// Tile version stamp in the TRD example format (`2026-06-17T14-30-00Z`).
+pub fn new_tile_version() -> String {
+    Utc::now().format("%Y-%m-%dT%H-%M-%SZ").to_string()
+}
+
+pub fn new_event_id() -> String {
+    format!("evt_{}", uuid::Uuid::new_v4().as_simple())
+}
+
+pub fn new_job_id() -> String {
+    format!("job_{}", uuid::Uuid::new_v4().as_simple())
+}
+
+/// SHA-256 of a source payload; useful for idempotency keys and the
+/// content-hash versioning option in TRD open question 3.
+pub fn source_hash(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(bytes))
+}
+
+/// Best-effort local path helper for tests and the CLI.
+pub fn ensure_dir(path: &Path) -> PipelineResult<()> {
+    fs::create_dir_all(path)?;
+    Ok(())
+}

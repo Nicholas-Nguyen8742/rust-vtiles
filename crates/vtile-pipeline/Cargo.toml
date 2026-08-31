@@ -1,0 +1,40 @@
+[package]
+name = "vtile-pipeline"
+description = "Job orchestration: validate → normalize → tile → publish, with tile sinks (local filesystem, S3), manifests, events, stores"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = []
+# Enables the S3 tile sink via the AWS SDK.
+aws = ["dep:aws-config", "dep:aws-sdk-s3", "dep:tokio", "dep:bytes"]
+
+[dependencies]
+vtile-core = { workspace = true }
+vtile-ingest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+rayon = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+aws-config = { workspace = true, optional = true }
+aws-sdk-s3 = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[[bin]]
+name = "vtile"
+path = "src/main.rs"
