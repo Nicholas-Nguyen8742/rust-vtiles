@@ -1,0 +1,28 @@
+[package]
+name = "vtile-api"
+description = "Ingestion/job/catalog HTTP API and local tile endpoint (TRD §8)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+vtile-core = { workspace = true }
+vtile-ingest = { workspace = true }
+vtile-pipeline = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+tower-http = { workspace = true }
+http = { workspace = true }
+chrono = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+
+[[bin]]
+name = "vtile-api"
+path = "src/main.rs"
