@@ -1,0 +1,19 @@
+[package]
+name = "vtile-ingest"
+description = "Ingestion and normalization of geospatial sources (GeoJSON, Shapefile) to EPSG:4326 features"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+vtile-core = { workspace = true }
+geo = { workspace = true }
+geo-types = { workspace = true }
+geojson = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+zip = { workspace = true }
+chrono = { workspace = true }
