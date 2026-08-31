@@ -1,0 +1,104 @@
+{
+  "type": "FeatureCollection",
+  "name": "nyc_parcels_sample",
+  "features": [
+    {
+      "type": "Feature",
+      "id": 1,
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [-73.9852100, 40.7529300],
+            [-73.9843200, 40.7530150],
+            [-73.9844100, 40.7536800],
+            [-73.9851450, 40.7537420],
+            [-73.9852100, 40.7529300]
+          ]
+        ]
+      },
+      "properties": {
+        "assetId": "AST-000123",
+        "parcelId": "NYC-BB-12345",
+        "propertyName": "Sample Office Asset",
+        "market": "New York",
+        "submarket": "Midtown",
+        "propertyType": "OFFICE",
+        "country": "US",
+        "currency": "USD",
+        "latitude": 40.7533400,
+        "longitude": -73.9847700,
+        "sourceSystem": "YARDI",
+        "lastVerifiedAt": "2026-05-01T00:00:00Z"
+      }
+    },
+    {
+      "type": "Feature",
+      "id": 2,
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [-73.9841500, 40.7530200],
+            [-73.9832400, 40.7529800],
+            [-73.9831750, 40.7537100],
+            [-73.9840900, 40.7537900],
+            [-73.9841500, 40.7530200]
+          ]
+        ]
+      },
+      "properties": {
+        "assetId": "AST-000124",
+        "parcelId": "NYC-BB-12346",
+        "propertyName": "Grand Central Mixed Use",
+        "market": "New York",
+        "submarket": "Midtown East",
+        "propertyType": "MIXED_USE",
+        "country": "US",
+        "currency": "USD",
+        "latitude": 40.7533850,
+        "longitude": -73.9836600,
+        "sourceSystem": "MRI",
+        "lastVerifiedAt": "2026-04-15T00:00:00Z"
+      }
+    },
+    {
+      "type": "Feature",
+      "id": 3,
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [-73.9863200, 40.7541100],
+            [-73.9847100, 40.7540200],
+            [-73.9845900, 40.7550800],
+            [-73.9862400, 40.7551750],
+            [-73.9863200, 40.7541100]
+          ],
+          [
+            [-73.9859800, 40.7543900],
+            [-73.9852100, 40.7543450],
+            [-73.9851600, 40.7548200],
+            [-73.9859350, 40.7548700],
+            [-73.9859800, 40.7543900]
+          ]
+        ]
+      },
+      "properties": {
+        "assetId": "AST-000125",
+        "parcelId": "NYC-BB-12347",
+        "propertyName": "Bryant Park North Parcel",
+        "market": "New York",
+        "submarket": "Midtown",
+        "propertyType": "OFFICE",
+        "country": "US",
+        "currency": "USD",
+        "latitude": 40.7545975,
+        "longitude": -73.9854550,
+        "sourceSystem": "YARDI",
+        "lastVerifiedAt": "2026-05-20T00:00:00Z",
+        "ownerName": "Sample Holdings LLC"
+      }
+    }
+  ]
+}

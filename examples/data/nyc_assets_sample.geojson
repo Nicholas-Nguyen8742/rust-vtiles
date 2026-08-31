@@ -1,0 +1,82 @@
+{
+  "type": "FeatureCollection",
+  "name": "nyc_assets_sample",
+  "features": [
+    {
+      "type": "Feature",
+      "id": 1,
+      "geometry": { "type": "Point", "coordinates": [-73.9855000, 40.7580000] },
+      "properties": {
+        "assetId": "AST-000123",
+        "propertyId": "PROP-8801",
+        "propertyName": "Times Square Tower",
+        "market": "New York",
+        "submarket": "Midtown",
+        "propertyType": "OFFICE",
+        "country": "US",
+        "currency": "USD",
+        "latitude": 40.7580000,
+        "longitude": -73.9855000,
+        "sourceSystem": "YARDI",
+        "lastVerifiedAt": "2026-05-01T00:00:00Z"
+      }
+    },
+    {
+      "type": "Feature",
+      "id": 2,
+      "geometry": { "type": "Point", "coordinates": [-73.9772000, 40.7527000] },
+      "properties": {
+        "assetId": "AST-000124",
+        "propertyId": "PROP-8802",
+        "propertyName": "Grand Central Office",
+        "market": "New York",
+        "submarket": "Midtown East",
+        "propertyType": "OFFICE",
+        "country": "US",
+        "currency": "USD",
+        "latitude": 40.7527000,
+        "longitude": -73.9772000,
+        "sourceSystem": "MRI",
+        "lastVerifiedAt": "2026-04-15T00:00:00Z"
+      }
+    },
+    {
+      "type": "Feature",
+      "id": 3,
+      "geometry": { "type": "Point", "coordinates": [-73.9933000, 40.7501000] },
+      "properties": {
+        "assetId": "AST-000125",
+        "propertyId": "PROP-8803",
+        "propertyName": "Hudson Yards Mixed Use",
+        "market": "New York",
+        "submarket": "Hudson Yards",
+        "propertyType": "MIXED_USE",
+        "country": "US",
+        "currency": "USD",
+        "latitude": 40.7501000,
+        "longitude": -73.9933000,
+        "sourceSystem": "YARDI",
+        "lastVerifiedAt": "2026-05-20T00:00:00Z"
+      }
+    },
+    {
+      "type": "Feature",
+      "id": 4,
+      "geometry": { "type": "Point", "coordinates": [-73.9812000, 40.7614000] },
+      "properties": {
+        "assetId": "AST-000126",
+        "propertyId": "PROP-8804",
+        "propertyName": "Fifth Avenue Retail",
+        "market": "New York",
+        "submarket": "Midtown",
+        "propertyType": "RETAIL",
+        "country": "US",
+        "currency": "USD",
+        "latitude": 40.7614000,
+        "longitude": -73.9812000,
+        "sourceSystem": "SALESFORCE",
+        "lastVerifiedAt": "2026-03-30T00:00:00Z"
+      }
+    }
+  ]
+}

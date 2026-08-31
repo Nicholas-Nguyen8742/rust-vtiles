@@ -1,0 +1,64 @@
+{
+  "type": "FeatureCollection",
+  "name": "nyc_flood_zones_sample",
+  "features": [
+    {
+      "type": "Feature",
+      "id": 1,
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [-74.0165000, 40.7042000],
+            [-74.0082000, 40.7031000],
+            [-74.0096000, 40.7148000],
+            [-74.0152000, 40.7163000],
+            [-74.0178000, 40.7109000],
+            [-74.0165000, 40.7042000]
+          ]
+        ]
+      },
+      "properties": {
+        "zoneId": "FEMA-AE-310001-0042",
+        "floodZone": "AE",
+        "riskScore": 82,
+        "baseFloodElevationFt": 11.0,
+        "sourceAgency": "FEMA",
+        "sourceDataset": "FIRM 2026",
+        "market": "New York",
+        "submarket": "Lower Manhattan West",
+        "country": "US",
+        "lastVerifiedAt": "2026-02-10T00:00:00Z"
+      }
+    },
+    {
+      "type": "Feature",
+      "id": 2,
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [-74.0189000, 40.7168000],
+            [-74.0117000, 40.7156000],
+            [-74.0103000, 40.7237000],
+            [-74.0171000, 40.7251000],
+            [-74.0196000, 40.7208000],
+            [-74.0189000, 40.7168000]
+          ]
+        ]
+      },
+      "properties": {
+        "zoneId": "FEMA-AE-310001-0057",
+        "floodZone": "AE",
+        "riskScore": 74,
+        "baseFloodElevationFt": 12.5,
+        "sourceAgency": "FEMA",
+        "sourceDataset": "FIRM 2026",
+        "market": "New York",
+        "submarket": "West Chelsea",
+        "country": "US",
+        "lastVerifiedAt": "2026-02-10T00:00:00Z"
+      }
+    }
+  ]
+}

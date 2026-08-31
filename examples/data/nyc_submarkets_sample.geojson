@@ -1,0 +1,64 @@
+{
+  "type": "FeatureCollection",
+  "name": "nyc_submarkets_sample",
+  "features": [
+    {
+      "type": "Feature",
+      "id": 1,
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [-73.9931000, 40.7478000],
+            [-73.9719000, 40.7493000],
+            [-73.9698000, 40.7622000],
+            [-73.9896000, 40.7641000],
+            [-73.9948000, 40.7567000],
+            [-73.9931000, 40.7478000]
+          ]
+        ]
+      },
+      "properties": {
+        "submarketCode": "NYC-MID",
+        "name": "Midtown",
+        "market": "New York",
+        "assetClassFocus": "OFFICE",
+        "vacancyRatePct": 11.4,
+        "askingRentPsf": 78.25,
+        "country": "US",
+        "currency": "USD",
+        "sourceSystem": "RESEARCH",
+        "lastVerifiedAt": "2026-06-01T00:00:00Z"
+      }
+    },
+    {
+      "type": "Feature",
+      "id": 2,
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [-73.9956000, 40.7379000],
+            [-73.9818000, 40.7366000],
+            [-73.9807000, 40.7472000],
+            [-73.9924000, 40.7481000],
+            [-73.9963000, 40.7437000],
+            [-73.9956000, 40.7379000]
+          ]
+        ]
+      },
+      "properties": {
+        "submarketCode": "NYC-MIDS",
+        "name": "Midtown South",
+        "market": "New York",
+        "assetClassFocus": "MIXED_USE",
+        "vacancyRatePct": 9.8,
+        "askingRentPsf": 64.90,
+        "country": "US",
+        "currency": "USD",
+        "sourceSystem": "RESEARCH",
+        "lastVerifiedAt": "2026-06-01T00:00:00Z"
+      }
+    }
+  ]
+}
