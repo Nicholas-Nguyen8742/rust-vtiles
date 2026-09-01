@@ -74,6 +74,16 @@ fn parcel_job(job_id: &str) -> JobRecord {
         error: None,
         error_code: None,
         failed_stage: None,
+        idempotency_key: None,
+        request_fingerprint: None,
+        event_dedupe_fingerprint: None,
+        state_version: 1,
+        lease_token: None,
+        locked_by: None,
+        lease_expires_at: None,
+        duplicate_event_count: 0,
+        requested_tile_version: None,
+        replay_audit: None,
         outcome: None,
         layer_input: Some(LayerMetadataInput {
             name: Some("NYC Parcels".to_string()),
@@ -613,6 +623,7 @@ fn missing_prj_fails_then_replays_with_assumed_wgs84() {
         job_id,
         &ReplayOptions {
             assume_wgs84: true,
+            ..Default::default()
         },
     )
     .expect("replay with assume-wgs84 should succeed");
@@ -642,10 +653,10 @@ fn replay_rejects_non_failed_and_unknown_jobs() {
     // Unknown job → descriptive error, not a panic.
     let err = replay_job(&deps(&root), &root, TENANT, "job_missing", &ReplayOptions::default())
         .expect_err("unknown job must fail");
-    assert!(err.to_string().contains("no quarantined input"));
+    assert!(err.to_string().contains("not found"), "got: {err}");
 
     // A QUEUED (non-FAILED) job cannot be replayed even if quarantine data
-    // exists for its id.
+    // exists for its id — Sequence 1 US-05 JOB_ALREADY_ACTIVE.
     let job = parcel_job("job_fx_guard");
     d.jobs.create(job.clone()).unwrap();
     let store = FileQuarantineStore::new(root.join("quarantine"));
@@ -656,7 +667,10 @@ fn replay_rejects_non_failed_and_unknown_jobs() {
     use vtile_pipeline::QuarantineStore;
     let err = replay_job(&deps(&root), &root, TENANT, "job_fx_guard", &ReplayOptions::default())
         .expect_err("queued job must not replay");
-    assert!(err.to_string().contains("FAILED"), "got: {err}");
+    assert!(
+        matches!(err, vtile_pipeline::PipelineError::JobAlreadyActive(_)),
+        "got: {err}"
+    );
 }
 
 #[test]
