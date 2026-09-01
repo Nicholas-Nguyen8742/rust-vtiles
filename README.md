@@ -96,6 +96,23 @@ Requires Rust ≥ 1.75 (`rustup` toolchain; see `rust-toolchain.toml`).
 cargo test --workspace          # unit + end-to-end pipeline tests
 ```
 
+### Local pipeline (one-command dev loop)
+
+The full ingestion loop runs locally with no cloud dependencies — see
+[`docs/LOCAL_DEV.md`](docs/LOCAL_DEV.md) for the walkthrough and
+[`docs/ERRORS.md`](docs/ERRORS.md) for the failure taxonomy.
+
+```bash
+make setup      # build + generate shapefile fixtures + local data dirs
+make run-local  # vtile-api on 127.0.0.1:8080 (foreground)
+
+# second terminal:
+make seed       # push every fixture through the upload API
+make smoke      # end-to-end: upload -> tiles -> TRD §8.5 status contracts
+make job-status JOB_ID=<jobId>
+make replay-job TENANT=tenant-acme JOB_ID=<failed jobId> ASSUME_WGS84=1
+```
+
 ### CLI: one-shot pipeline run
 
 ```bash
@@ -173,15 +190,38 @@ production cutover checklist.
 | §8 API contracts | `vtile-api/src/routes/*` |
 | §9 events (submitted/completed/failed) | `vtile-pipeline/src/events.rs` |
 | §10 12-state workflow | `vtile-pipeline/src/job.rs` |
+| §10 validation gates + error taxonomy | `vtile-ingest/src/validate.rs`, `docs/ERRORS.md` |
 | §11 AWS components | `terraform/` scaffold (S3, SQS, Step Functions, ECS, CloudFront, DynamoDB, KMS, IAM) |
 | §13 security (tenant isolation, CORS, SSE-KMS, PII) | `vtile-api/src/auth.rs`, property denylist, `terraform/kms.tf` |
 | §14 NFRs (idempotency, atomic publish/rollback, retries) | `job.rs` idempotency guard, manifest swap, SQS redrive ×3 |
+| DLQ/quarantine/replay workflow | `vtile-pipeline/src/{quarantine,replay}.rs` |
+| Local dev loop (make targets, fixtures, smoke) | `Makefile`, `scripts/`, `docs/LOCAL_DEV.md` |
 
 ## Documentation
 
+- [`docs/LOCAL_DEV.md`](docs/LOCAL_DEV.md) — local pipeline walkthrough: make targets, data layout, job lifecycle, failure/replay, Docker
+- [`docs/ERRORS.md`](docs/ERRORS.md) — the error taxonomy: codes, HTTP statuses, failed stages, quarantine + replay semantics
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — component map, workflow, storage layout, production cutover
 - [`docs/MVT.md`](docs/MVT.md) — the MVT v2 wire format and how the encoder works
 - [`docs/PRECISION.md`](docs/PRECISION.md) — 7-decimal requirement vs. MVT quantization per zoom (read this before trusting tile geometry for measurement)
+
+## Test fixtures
+
+`tests/fixtures/` holds deterministic CRE fixtures for the local pipeline and
+CI (Recommendation 1 US-02); each has a documented expected outcome in
+[`tests/fixtures/CATALOG.md`](tests/fixtures/CATALOG.md):
+
+- GeoJSON (checked in): parcels with a PII field to strip, asset points, a
+  null-island edge case, an oversized-properties case, and an invalid polygon
+  that exercises the `GEOMETRY_ERRORS` + quarantine path.
+- Zipped Shapefiles (generated, kept out of Git): a complete bundle, a
+  missing-`.dbf` bundle (`MISSING_SHAPEFILE_COMPONENTS`), and a missing-`.prj`
+  bundle (`UNKNOWN_CRS` → replayable with `--assume-wgs84`).
+
+```bash
+make fixtures   # regenerate the shapefile bundles
+make seed       # push every fixture through the running local API
+```
 
 ## Sample data
 
