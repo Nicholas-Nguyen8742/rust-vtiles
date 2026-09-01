@@ -17,6 +17,8 @@ pub mod error;
 pub mod events;
 pub mod job;
 pub mod manifest;
+pub mod quarantine;
+pub mod replay;
 pub mod sink_local;
 #[cfg(feature = "aws")]
 pub mod sink_s3;
@@ -25,3 +27,5 @@ pub mod store;
 pub use error::{PipelineError, PipelineResult};
 pub use job::{run_job, JobDeps, RunJobInput};
 pub use manifest::TileManifest;
+pub use quarantine::{ErrorReport, FileQuarantineStore, QuarantineStore};
+pub use replay::{replay_job, ReplayOptions};
