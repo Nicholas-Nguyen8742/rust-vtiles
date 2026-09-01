@@ -22,6 +22,11 @@ pub struct UploadRequest {
     /// Assume EPSG:4326 when a shapefile has no .prj (US-04).
     #[serde(default)]
     pub assume_crs_wgs84: bool,
+    /// Named processing profile (e.g. `parcel_high_zoom`); participates in
+    /// the idempotency key (Sequence 1 US-01). Defaults to the
+    /// category+zoom-derived label when absent.
+    #[serde(default)]
+    pub processing_profile: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -42,6 +47,9 @@ pub struct LayerMetadataInputDto {
 #[serde(rename_all = "camelCase")]
 pub struct UploadResponse {
     pub job_id: String,
+    /// Sequence 1 US-01: key under which duplicate upload requests converge
+    /// to the same job.
+    pub idempotency_key: String,
     pub upload_url: String,
     pub expires_in: u64,
     pub status: JobStatus,

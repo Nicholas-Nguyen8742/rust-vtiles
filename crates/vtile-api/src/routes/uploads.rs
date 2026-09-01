@@ -1,10 +1,11 @@
-//! Upload/job-creation endpoints (TRD §8.1).
+//! Upload/job-creation endpoints (TRD §8.1), extended by the idempotency
+//! epic (Sequence 1 US-01/US-02/US-03).
 
 use std::sync::Arc;
 
 use axum::body::Bytes;
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use chrono::Utc;
 
@@ -13,9 +14,16 @@ use vtile_core::model::{JobRecord, JobStatus, LayerCategory};
 use vtile_ingest::normalize::{CrsPolicy, NormalizeOptions};
 use vtile_ingest::validate::validate_file_type;
 use vtile_pipeline::events::PipelineEvent;
-use vtile_pipeline::job::{new_job_id, run_job, JobPaths, RunJobInput};
-use vtile_pipeline::FileQuarantineStore;
-use vtile_pipeline::JobDeps;
+use vtile_pipeline::job::{
+    new_idempotency_token, new_job_id, new_tile_version, run_job, source_hash, JobPaths,
+    RunJobInput,
+};
+use vtile_pipeline::{
+    classify_ingest_event, event_dedupe_fingerprint, processing_profile_label,
+    request_fingerprint, upload_idempotency_key, DedupeRecord, EventDecision, FileDedupeStore,
+    FileOrphanStore, FileQuarantineStore, IdempotencyMetrics, JobDeps, Metric, OrphanEvent,
+    PipelineError,
+};
 
 use crate::dto::{UploadAcceptedResponse, UploadRequest, UploadResponse};
 use crate::error::ApiError;
@@ -27,8 +35,15 @@ use crate::state::AppState;
 ///
 /// Production: `uploadUrl` is an S3 presigned PUT (TRD §13, 15-minute
 /// expiry). Locally it points at this API's content endpoint.
+///
+/// Idempotency (Sequence 1 US-01/US-02): the optional `Idempotency-Key`
+/// header binds repeat requests to one job. Same key + equivalent payload →
+/// the existing job is returned (HTTP 200); same key + different payload →
+/// `409 IDEMPOTENCY_KEY_PAYLOAD_MISMATCH`. Requests without a token always
+/// receive a fresh job (intentional vendor-refresh uploads).
 pub async fn create_upload(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(req): Json<UploadRequest>,
 ) -> Result<(StatusCode, Json<UploadResponse>), ApiError> {
     if req.tenant_id.trim().is_empty() || req.layer_id.trim().is_empty() {
@@ -71,6 +86,41 @@ pub async fn create_upload(
         }
     }
 
+    // ── Sequence 1 US-01/US-02: idempotent job creation ───────────────────
+    let client_token = headers
+        .get("idempotency-key")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(new_idempotency_token);
+    let profile = req
+        .processing_profile
+        .clone()
+        .unwrap_or_else(|| processing_profile_label(category, zoom_range));
+    let idempotency_key = upload_idempotency_key(
+        &req.tenant_id,
+        &req.layer_id,
+        &client_token,
+        &profile,
+    );
+    let payload_fingerprint = request_fingerprint(
+        &req.file_name,
+        req.content_type.as_deref(),
+        req.source_format,
+        zoom_range,
+        &profile,
+    );
+
+    if let Some(existing) = state.jobs.find_by_idempotency_key(&idempotency_key)? {
+        return resolve_existing_upload(
+            &existing,
+            &payload_fingerprint,
+            idempotency_key,
+            state.upload_expires_secs,
+        );
+    }
+
     let job_id = new_job_id();
     let now = Utc::now();
     let staging_root = state
@@ -91,20 +141,94 @@ pub async fn create_upload(
         error: None,
         error_code: None,
         failed_stage: None,
+        idempotency_key: Some(idempotency_key.clone()),
+        request_fingerprint: Some(payload_fingerprint.clone()),
+        event_dedupe_fingerprint: None,
+        state_version: 1,
+        lease_token: None,
+        locked_by: None,
+        lease_expires_at: None,
+        duplicate_event_count: 0,
+        requested_tile_version: Some(new_tile_version()),
+        replay_audit: None,
         outcome: None,
         layer_input,
     };
-    state.jobs.create(job.clone())?;
-    tracing::info!(job_id = %job_id, tenant = %req.tenant_id, layer = %req.layer_id, "upload job created");
+
+    // Conditional create (US-01). Losing the race to a concurrent request
+    // with the same key converges on the winner's record.
+    match state.jobs.create(job.clone()) {
+        Ok(()) => {}
+        Err(PipelineError::JobAlreadyExists(_)) => {
+            if let Some(existing) = state.jobs.find_by_idempotency_key(&idempotency_key)? {
+                return resolve_existing_upload(
+                    &existing,
+                    &payload_fingerprint,
+                    idempotency_key,
+                    state.upload_expires_secs,
+                );
+            }
+            return Err(ApiError::internal(
+                "job registry conflict: duplicate jobId without a matching idempotency key",
+            ));
+        }
+        Err(e) => return Err(e.into()),
+    }
+
+    tracing::info!(
+        job_id = %job_id,
+        tenant = %req.tenant_id,
+        layer = %req.layer_id,
+        idempotency_key = %idempotency_key,
+        "upload job created"
+    );
 
     Ok((
         StatusCode::ACCEPTED,
         Json(UploadResponse {
             job_id,
+            idempotency_key,
             upload_url: format!("/api/v1/ingest/uploads/{job_id}/content"),
             expires_in: state.upload_expires_secs,
             status: JobStatus::UploadPending,
         }),
+    ))
+}
+
+/// US-01/US-02 duplicate-upload resolution: equivalent payload → return the
+/// existing job; different payload → `409 IDEMPOTENCY_KEY_PAYLOAD_MISMATCH`.
+fn resolve_existing_upload(
+    existing: &JobRecord,
+    payload_fingerprint: &str,
+    idempotency_key: String,
+    expires_secs: u64,
+) -> Result<(StatusCode, Json<UploadResponse>), ApiError> {
+    if existing.request_fingerprint.as_deref() == Some(payload_fingerprint) {
+        IdempotencyMetrics::global().inc(Metric::IdempotentReplays);
+        tracing::info!(
+            job_id = %existing.job_id,
+            idempotency_key = %idempotency_key,
+            "duplicate upload request resolved to existing job"
+        );
+        return Ok((
+            StatusCode::OK,
+            Json(UploadResponse {
+                job_id: existing.job_id.clone(),
+                idempotency_key,
+                upload_url: format!("/api/v1/ingest/uploads/{}/content", existing.job_id),
+                expires_in: expires_secs,
+                status: existing.status,
+            }),
+        ));
+    }
+    IdempotencyMetrics::global().inc(Metric::IdempotencyKeyConflicts);
+    Err(ApiError::new(
+        StatusCode::CONFLICT,
+        "IDEMPOTENCY_KEY_PAYLOAD_MISMATCH",
+        format!(
+            "Idempotency-Key was already used with a different payload (job {})",
+            existing.job_id
+        ),
     ))
 }
 
@@ -113,24 +237,43 @@ pub async fn create_upload(
 ///
 /// This handler is the local stand-in for the production chain
 /// `S3 presigned upload → S3 event → SQS → Step Functions → Fargate`
-/// (TRD §2): it persists the payload to staging, emits `job.submitted`, and
-/// runs the pipeline in a blocking task.
+/// (TRD §2), including the at-least-once redelivery semantics: repeated
+/// events are classified and suppressed (Sequence 1 US-03) instead of
+/// starting duplicate runs.
 pub async fn upload_content(
     State(state): State<Arc<AppState>>,
     Path(job_id): Path<String>,
     body: Bytes,
 ) -> Result<(StatusCode, Json<UploadAcceptedResponse>), ApiError> {
-    let job = state
-        .jobs
-        .get(&job_id)?
-        .ok_or_else(|| ApiError::not_found("JOB_NOT_FOUND", format!("job {job_id} not found")))?;
-    if job.status.is_terminal() {
-        return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            "JOB_TERMINAL",
-            format!("job {job_id} is already in a terminal state"),
-        ));
-    }
+    let job = match state.jobs.get(&job_id)? {
+        Some(job) => job,
+        None => {
+            // Sequence 1 US-01/US-03: an event with no resolvable job goes
+            // to the orphan path (recorded + alerted) — never silently
+            // creates an untracked job.
+            let orphan = OrphanEvent {
+                source_event_type: "UPLOAD_CONTENT".to_string(),
+                object_key: format!("staging/{job_id}"),
+                etag: None,
+                tenant_id: None,
+                reason: "content PUT for an unknown jobId".to_string(),
+                detected_at: Utc::now(),
+            };
+            let orphans = FileOrphanStore::new(state.data_dir.join("orphans"));
+            if let Ok(path) = orphans.record(&orphan) {
+                tracing::warn!(
+                    job_id = %job_id,
+                    orphan = %path.display(),
+                    "orphan upload event recorded"
+                );
+            }
+            IdempotencyMetrics::global().inc(Metric::OrphanEventsDetected);
+            return Err(ApiError::not_found(
+                "JOB_NOT_FOUND",
+                format!("job {job_id} not found"),
+            ));
+        }
+    };
 
     // TRD §10: reject oversized payloads with 413.
     let size = body.len() as u64;
@@ -142,10 +285,69 @@ pub async fn upload_content(
         ));
     }
     if size == 0 {
-        return Err(ApiError::unprocessable("EMPTY_DATASET", "upload body is empty"));
+        return Err(ApiError::unprocessable(
+            "EMPTY_DATASET",
+            "upload body is empty",
+        ));
     }
 
-    state.jobs.update_status(&job_id, JobStatus::Queued, None)?;
+    // ── Sequence 1 US-03: duplicate event suppression ─────────────────────
+    // The content PUT is the local event; the fingerprint mirrors
+    // SHA-256(tenant + layer + objectKey + etag + jobId), with the payload
+    // SHA-256 standing in for the S3 ETag.
+    let etag = source_hash(&body);
+    let object_key = job.source_uri.trim_start_matches("file://").to_string();
+    let fingerprint = event_dedupe_fingerprint(
+        &job.tenant_id,
+        &job.layer_id,
+        &object_key,
+        &etag,
+        &job.job_id,
+    );
+    let dedupe = FileDedupeStore::new(state.data_dir.join("dedupe"));
+    let decision = classify_ingest_event(Some(&job), dedupe.seen(&fingerprint)?);
+    match decision {
+        EventDecision::Orphan => {
+            // Defensive: the job resolved above, so this is unreachable.
+            return Err(ApiError::not_found(
+                "JOB_NOT_FOUND",
+                format!("job {job_id} not found"),
+            ));
+        }
+        EventDecision::DuplicateSuppressed | EventDecision::TerminalAck => {
+            IdempotencyMetrics::global().inc(Metric::DuplicateEventsSuppressed);
+            state.jobs.note_duplicate_event(&job.job_id)?;
+            tracing::info!(
+                job_id = %job.job_id,
+                status = job.status.as_str(),
+                decision = format!("{decision:?}"),
+                "duplicate event acknowledged; no new work started"
+            );
+            return Ok((
+                StatusCode::ACCEPTED,
+                Json(UploadAcceptedResponse {
+                    job_id,
+                    status: job.status,
+                }),
+            ));
+        }
+        EventDecision::StartRun => {}
+    }
+    dedupe.record(&DedupeRecord {
+        dedupe_key: fingerprint.clone(),
+        job_id: job.job_id.clone(),
+        seen_at: Utc::now(),
+        source_event_type: "UPLOAD_CONTENT".to_string(),
+    })?;
+
+    // Bind the event to the job and enqueue (UPLOAD_PENDING → QUEUED).
+    let mut queued = job.clone();
+    queued.status = JobStatus::Queued;
+    queued.event_dedupe_fingerprint = Some(fingerprint);
+    queued.state_version += 1;
+    queued.updated_at = Utc::now();
+    state.jobs.upsert(queued)?;
+
     state.events.emit(PipelineEvent::VectorTileJobSubmitted {
         event_id: vtile_pipeline::job::new_event_id(),
         tenant_id: job.tenant_id.clone(),

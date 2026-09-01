@@ -40,6 +40,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 
     Router::new()
         .route("/healthz", get(routes::health::healthz))
+        .route("/internal/metrics", get(routes::health::metrics))
         .route("/api/v1/ingest/uploads", post(routes::uploads::create_upload))
         .route(
             "/api/v1/ingest/uploads/:job_id/content",
