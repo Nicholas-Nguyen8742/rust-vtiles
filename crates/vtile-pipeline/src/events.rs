@@ -7,7 +7,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-/// The three lifecycle events defined in TRD §9.
+/// The three lifecycle events defined in TRD §9, plus the replay audit
+/// event added by the idempotency epic (Sequence 1 US-05).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "eventType")]
 pub enum PipelineEvent {
@@ -43,6 +44,19 @@ pub enum PipelineEvent {
         error_message: String,
         occurred_at: DateTime<Utc>,
     },
+    /// Sequence 1 US-05: audit trail for replays — who requested it, why,
+    /// and whether a new tile version was explicitly authorized.
+    #[serde(rename = "vector.tile.job.replay_requested")]
+    VectorTileJobReplayRequested {
+        event_id: String,
+        tenant_id: String,
+        job_id: String,
+        layer_id: String,
+        requested_by: String,
+        reason: String,
+        create_new_version: bool,
+        occurred_at: DateTime<Utc>,
+    },
 }
 
 impl PipelineEvent {
@@ -51,6 +65,9 @@ impl PipelineEvent {
             PipelineEvent::VectorTileJobSubmitted { .. } => "vector.tile.job.submitted",
             PipelineEvent::VectorTileJobCompleted { .. } => "vector.tile.job.completed",
             PipelineEvent::VectorTileJobFailed { .. } => "vector.tile.job.failed",
+            PipelineEvent::VectorTileJobReplayRequested { .. } => {
+                "vector.tile.job.replay_requested"
+            }
         }
     }
 }
