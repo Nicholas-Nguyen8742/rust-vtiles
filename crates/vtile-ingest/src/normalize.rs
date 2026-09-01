@@ -37,6 +37,9 @@ pub enum SourceFile {
 #[derive(Debug, Clone)]
 pub struct NormalizeOptions {
     pub max_upload_bytes: u64,
+    /// Feature-count cap (TRD §14 scalability). Exceeding it fails fast with
+    /// `FILE_TOO_LARGE` before tile generation.
+    pub max_features: u64,
     pub crs_policy: CrsPolicy,
     pub property_policy: PropertyPolicy,
 }
@@ -45,6 +48,7 @@ impl Default for NormalizeOptions {
     fn default() -> Self {
         Self {
             max_upload_bytes: crate::validate::DEFAULT_MAX_UPLOAD_BYTES,
+            max_features: crate::validate::DEFAULT_MAX_FEATURES,
             crs_policy: CrsPolicy::RequireKnown,
             property_policy: PropertyPolicy::default(),
         }
@@ -91,6 +95,7 @@ pub fn normalize_source(source: SourceFile, opts: &NormalizeOptions) -> IngestRe
 
 fn normalize_geojson(bytes: &[u8], opts: &NormalizeOptions) -> IngestResult<NormalizedDataset> {
     let parsed = parse_geojson(bytes)?;
+    crate::validate::check_feature_count(parsed.len() as u64, opts.max_features)?;
     // RFC 7946: GeoJSON is always WGS84 lon/lat.
     let crs = CrsInfo {
         kind: CrsKind::Wgs84,
@@ -129,6 +134,7 @@ fn normalize_shapefile(bytes: &[u8], opts: &NormalizeOptions) -> IngestResult<No
     };
 
     let pairs = read_bundle(&bundle)?;
+    crate::validate::check_feature_count(pairs.len() as u64, opts.max_features)?;
     let features = pairs.into_iter().enumerate().map(|(idx, (geom, props))| {
         // Synthetic sequential ids preserve row linkage (see bundle docs).
         (Some(idx as u64 + 1), geom, props)
@@ -197,6 +203,17 @@ fn finish_normalization(
         });
     }
 
+    // TRD §4 rule 3: reject files whose features are all unrecoverable. The
+    // distinction matters for operators: an empty *source* is a data-entry
+    // problem (`EMPTY_DATASET`), a source whose geometries all failed repair
+    // is a geometry problem (`GEOMETRY_ERRORS`).
+    if dataset.feature_count() == 0 && dataset.rejected_features > 0 {
+        return Err(IngestError::GeometryErrors {
+            unrecoverable: dataset.rejected_features,
+            first: "all features failed geometry repair (degenerate rings, non-finite coordinates)"
+                .into(),
+        });
+    }
     crate::validate::require_non_empty(dataset.feature_count(), format)?;
 
     if crs.assumed {
