@@ -55,6 +55,21 @@ impl JobStatus {
     pub fn is_terminal(&self) -> bool {
         matches!(self, Self::Completed | Self::Failed)
     }
+
+    /// Serialized form (matches the serde `SCREAMING_SNAKE_CASE` rename),
+    /// used for `failedStage` reporting without a serde round-trip.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::UploadPending => "UPLOAD_PENDING",
+            Self::Queued => "QUEUED",
+            Self::Validating => "VALIDATING",
+            Self::Normalizing => "NORMALIZING",
+            Self::Tiling => "TILING",
+            Self::Publishing => "PUBLISHING",
+            Self::Completed => "COMPLETED",
+            Self::Failed => "FAILED",
+        }
+    }
 }
 
 /// layer categories (TRD §1 + §5 zoom strategy).
@@ -192,6 +207,14 @@ pub struct JobRecord {
     pub updated_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Machine-readable taxonomy code of the failure (e.g.
+    /// `MISSING_SHAPEFILE_COMPONENTS`); see `docs/ERRORS.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    /// Workflow stage that failed (e.g. `NORMALIZING`), so operators can see
+    /// where in the TRD §10 state machine the job stopped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_stage: Option<String>,
     /// Populated when the job completes (feature count, tile count, bbox...).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<JobOutcomeSummary>,
