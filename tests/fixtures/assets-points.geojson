@@ -1,0 +1,54 @@
+{
+  "type": "FeatureCollection",
+  "name": "assets-points",
+  "features": [
+    {
+      "type": "Feature",
+      "id": 1,
+      "geometry": { "type": "Point", "coordinates": [-73.9855, 40.7580] },
+      "properties": {
+        "assetId": "AST-200001",
+        "propertyName": "Empire State Sample",
+        "market": "New York",
+        "submarket": "Midtown",
+        "propertyType": "OFFICE"
+      }
+    },
+    {
+      "type": "Feature",
+      "id": 2,
+      "geometry": { "type": "Point", "coordinates": [-73.9890, 40.7505] },
+      "properties": {
+        "assetId": "AST-200002",
+        "propertyName": "Hudson Yards Sample",
+        "market": "New York",
+        "submarket": "West Side",
+        "propertyType": "MIXED_USE"
+      }
+    },
+    {
+      "type": "Feature",
+      "id": 3,
+      "geometry": { "type": "Point", "coordinates": [-73.9780, 40.7527] },
+      "properties": {
+        "assetId": "AST-200003",
+        "propertyName": "Grand Central Sample",
+        "market": "New York",
+        "submarket": "Midtown East",
+        "propertyType": "OFFICE"
+      }
+    },
+    {
+      "type": "Feature",
+      "id": 4,
+      "geometry": { "type": "Point", "coordinates": [-73.9712, 40.7644] },
+      "properties": {
+        "assetId": "AST-200004",
+        "propertyName": "Plaza District Sample",
+        "market": "New York",
+        "submarket": "Plaza",
+        "propertyType": "HOSPITALITY"
+      }
+    }
+  ]
+}

@@ -1,0 +1,85 @@
+{
+  "type": "FeatureCollection",
+  "name": "simple-parcels",
+  "features": [
+    {
+      "type": "Feature",
+      "id": 1,
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [-73.9852100, 40.7529300],
+            [-73.9843200, 40.7530150],
+            [-73.9844100, 40.7536800],
+            [-73.9851450, 40.7537420],
+            [-73.9852100, 40.7529300]
+          ]
+        ]
+      },
+      "properties": {
+        "assetId": "AST-100001",
+        "parcelId": "NYC-FX-00001",
+        "propertyName": "Fixture Office Asset",
+        "market": "New York",
+        "submarket": "Midtown",
+        "propertyType": "OFFICE",
+        "country": "US",
+        "currency": "USD"
+      }
+    },
+    {
+      "type": "Feature",
+      "id": 2,
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [-73.9841500, 40.7530200],
+            [-73.9832400, 40.7529800],
+            [-73.9831750, 40.7537100],
+            [-73.9840900, 40.7537900],
+            [-73.9841500, 40.7530200]
+          ]
+        ]
+      },
+      "properties": {
+        "assetId": "AST-100002",
+        "parcelId": "NYC-FX-00002",
+        "propertyName": "Fixture Retail Asset",
+        "market": "New York",
+        "submarket": "Midtown East",
+        "propertyType": "RETAIL",
+        "country": "US",
+        "currency": "USD"
+      }
+    },
+    {
+      "type": "Feature",
+      "id": 3,
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [-73.9830500, 40.7528900],
+            [-73.9823900, 40.7529350],
+            [-73.9823300, 40.7536200],
+            [-73.9830050, 40.7536750],
+            [-73.9830500, 40.7528900]
+          ]
+        ]
+      },
+      "properties": {
+        "assetId": "AST-100003",
+        "parcelId": "NYC-FX-00003",
+        "propertyName": "Fixture Multifamily Asset",
+        "market": "New York",
+        "submarket": "Midtown",
+        "propertyType": "MULTIFAMILY",
+        "country": "US",
+        "currency": "USD",
+        "ownerName": "Should Be Stripped LLC"
+      }
+    }
+  ]
+}

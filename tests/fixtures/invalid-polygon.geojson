@@ -1,0 +1,25 @@
+{
+  "type": "FeatureCollection",
+  "name": "invalid-polygon",
+  "features": [
+    {
+      "type": "Feature",
+      "id": 1,
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [-73.9900000, 40.7500000],
+            [-73.9800000, 40.7600000],
+            [-73.9800000, 40.7600000],
+            [-73.9900000, 40.7500000]
+          ]
+        ]
+      },
+      "properties": {
+        "parcelId": "NYC-BAD-00001",
+        "market": "New York"
+      }
+    }
+  ]
+}

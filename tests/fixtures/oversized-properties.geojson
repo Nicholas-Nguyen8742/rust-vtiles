@@ -1,0 +1,38 @@
+{
+  "type": "FeatureCollection",
+  "name": "oversized-properties",
+  "features": [
+    {
+      "type": "Feature",
+      "id": 1,
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [-73.9852100, 40.7529300],
+            [-73.9843200, 40.7530150],
+            [-73.9844100, 40.7536800],
+            [-73.9851450, 40.7537420],
+            [-73.9852100, 40.7529300]
+          ]
+        ]
+      },
+      "properties": {
+        "assetId": "AST-400001",
+        "parcelId": "NYC-OP-00001",
+        "propertyName": "Attribute Bloat Sample",
+        "market": "New York",
+        "submarket": "Midtown",
+        "propertyType": "OFFICE",
+        "ownerName": "PII Should Never Reach Tiles LLC",
+        "mailing_address": "123 Any Street, Anytown, USA 00000",
+        "legalDescription": "LOT 12 BLOCK 881 OF THE GREAT CITY TRACT AS RECORDED IN THE OFFICE OF THE CITY REGISTER, TOGETHER WITH ALL APPURTENANCES AND HEREDITAMENTS THEREUNTO BELONGING, INCLUDING AIR RIGHTS AND SUBSURFACE EASEMENTS GRANTED BY DEED DATED JANUARY 1 1901 AND RECORDED IN LIBER 1 PAGE 1, RESERVING UNTO THE GRANTOR ALL MINERAL RIGHTS",
+        "assessmentNotes": "Property was reassessed following the 2024 market correction; assessor flagged the improvement value as inconsistent with comparable sales in the submarket pending further review by the valuation committee and external appraisal",
+        "zoningNotes": "Current zoning permits FAR 15 as of right with a potential bonus of 20 percent via the inclusionary housing program subject to community board review and environmental determination",
+        "brokerRemarks": "Trophy asset with unobstructed views, recently renovated mechanicals, and significant below-market rent roll that presents a compelling value-add opportunity for institutional capital",
+        "escalationClause": "Base rent escalates three percent annually with CPI adjustment capped at four percent and a fair market value reset upon renewal",
+        "titleExceptions": "Easement for utility access recorded at liber 2 page 2, restrictive covenant limiting building height, party wall agreement with adjacent parcel"
+      }
+    }
+  ]
+}

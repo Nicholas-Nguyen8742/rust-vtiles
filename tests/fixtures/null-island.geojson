@@ -1,0 +1,39 @@
+{
+  "type": "FeatureCollection",
+  "name": "null-island",
+  "features": [
+    {
+      "type": "Feature",
+      "id": 1,
+      "geometry": { "type": "Point", "coordinates": [0.0, 0.0] },
+      "properties": {
+        "assetId": "AST-300001",
+        "propertyName": "Geocoding Failure Sample",
+        "market": "Unknown"
+      }
+    },
+    {
+      "type": "Feature",
+      "id": 2,
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [-73.9852100, 40.7529300],
+            [-73.9843200, 40.7530150],
+            [-73.9844100, 40.7536800],
+            [-73.9851450, 40.7537420],
+            [-73.9852100, 40.7529300]
+          ]
+        ]
+      },
+      "properties": {
+        "assetId": "AST-300002",
+        "parcelId": "NYC-NI-00002",
+        "market": "New York",
+        "submarket": "Midtown",
+        "propertyType": "OFFICE"
+      }
+    }
+  ]
+}
