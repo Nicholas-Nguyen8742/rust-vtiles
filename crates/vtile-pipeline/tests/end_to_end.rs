@@ -1,7 +1,9 @@
 //! End-to-end pipeline tests: sample GeoJSON → normalize → MVT → publish.
 //!
 //! These exercise the full TRD §10 workflow in-process via `run_job`,
-//! against the sample datasets in `examples/data/`.
+//! against the sample datasets in `examples/data/` and the fixture library
+//! in `tests/fixtures/` (Recommendation 1 US-02), including the
+//! validation-failure, quarantine, and replay paths (Recommendation 3).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -15,10 +17,12 @@ use vtile_core::model::{
     JobRecord, JobStatus, LayerCategory, LayerMetadataInput, SourceFormat, ZoomRange,
 };
 use vtile_ingest::normalize::{CrsPolicy, NormalizeOptions};
+use vtile_ingest::shapefile::write::sample_parcel_bundle;
 use vtile_pipeline::events::{EventEmitter, NullEventEmitter, PipelineEvent};
-use vtile_pipeline::job::{run_job, JobDeps, JobPaths, RunJobInput};
+use vtile_pipeline::job::{job_paths_for, run_job, JobDeps, JobPaths, RunJobInput};
+use vtile_pipeline::quarantine::{FileQuarantineStore, INPUT_FILE_NAME, REPORT_FILE_NAME};
 use vtile_pipeline::store::{FileJobStore, FileLayerCatalog, JobStore, LayerCatalog};
-use vtile_pipeline::TileManifest;
+use vtile_pipeline::{replay_job, ReplayOptions, TileManifest};
 
 const TENANT: &str = "tenant-acme";
 const LAYER: &str = "us-parcels-nyc";
@@ -29,6 +33,15 @@ fn sample(name: &str) -> PathBuf {
         .join("..")
         .join("examples")
         .join("data")
+        .join(name)
+}
+
+fn fixture(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("tests")
+        .join("fixtures")
         .join(name)
 }
 
@@ -59,6 +72,8 @@ fn parcel_job(job_id: &str) -> JobRecord {
         created_at: Utc::now(),
         updated_at: Utc::now(),
         error: None,
+        error_code: None,
+        failed_stage: None,
         outcome: None,
         layer_input: Some(LayerMetadataInput {
             name: Some("NYC Parcels".to_string()),
@@ -74,6 +89,7 @@ fn normalize_opts() -> NormalizeOptions {
         max_upload_bytes: 50 * 1024 * 1024,
         crs_policy: CrsPolicy::RequireKnown,
         property_policy: PropertyPolicy::default(),
+        ..Default::default()
     }
 }
 
@@ -82,6 +98,16 @@ fn tile_config() -> TileConfig {
         layer_name: "parcel_boundary".to_string(),
         zoom_range: ZoomRange::new(12, 15),
         ..Default::default()
+    }
+}
+
+/// Full local service wiring, including the quarantine store.
+fn deps(root: &Path) -> JobDeps {
+    JobDeps {
+        jobs: Arc::new(FileJobStore::new(root.join("jobs")).unwrap()),
+        catalog: Arc::new(FileLayerCatalog::new(root.join("catalog.json")).unwrap()),
+        events: Arc::new(NullEventEmitter),
+        quarantine: Some(Arc::new(FileQuarantineStore::new(root.join("quarantine")))),
     }
 }
 
@@ -108,6 +134,7 @@ fn geojson_parcels_end_to_end() {
         jobs: jobs.clone(),
         catalog: catalog.clone(),
         events: Arc::new(NullEventEmitter),
+        quarantine: None,
     };
 
     let job = parcel_job("job_e2e_parcels");
@@ -131,6 +158,8 @@ fn geojson_parcels_end_to_end() {
     // ── Job record finalized ──────────────────────────────────────────────
     let stored = jobs.get("job_e2e_parcels").unwrap().expect("job stored");
     assert_eq!(stored.status, JobStatus::Completed);
+    assert!(stored.error_code.is_none());
+    assert!(stored.failed_stage.is_none());
     let summary = stored.outcome.expect("outcome summary attached");
     assert_eq!(summary.feature_count, 3);
     assert_eq!(summary.published_tile_count, 4);
@@ -149,6 +178,12 @@ fn geojson_parcels_end_to_end() {
     assert_eq!(manifest.min_zoom, 12);
     assert_eq!(manifest.max_zoom, 15);
     assert_eq!(manifest.bounding_box.to_vec(), bbox);
+
+    // ── latest.json live pointer (Recommendation 2 US-04) ────────────────
+    let latest_json = fs::read_to_string(input.paths.latest_path()).unwrap();
+    let latest = TileManifest::from_json(&latest_json).unwrap();
+    assert_eq!(latest.tile_version, manifest.tile_version);
+    assert_eq!(latest.tile_count, manifest.tile_count);
 
     // ── Tiles on disk: versioned prefix, valid MVT v2 ────────────────────
     let version_root = input.paths.tiles_root.join(&outcome.tile_version);
@@ -208,6 +243,7 @@ fn rerunning_completed_job_is_rejected_idempotently() {
         jobs: jobs.clone(),
         catalog: catalog.clone(),
         events: Arc::new(NullEventEmitter),
+        quarantine: None,
     };
 
     let job = parcel_job("job_e2e_idem");
@@ -238,6 +274,19 @@ impl EventEmitter for CapturingEmitter {
     }
 }
 
+fn failed_event_codes(emitter: &Arc<CapturingEmitter>) -> Vec<String> {
+    emitter
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|e| match e {
+            PipelineEvent::VectorTileJobFailed { error_code, .. } => Some(error_code.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 #[test]
 fn empty_dataset_fails_with_trd_error_code() {
     let root = temp_root("empty");
@@ -248,6 +297,7 @@ fn empty_dataset_fails_with_trd_error_code() {
         jobs: jobs.clone(),
         catalog: catalog.clone(),
         events: emitter.clone(),
+        quarantine: None,
     };
 
     let job = parcel_job("job_e2e_empty");
@@ -267,17 +317,11 @@ fn empty_dataset_fails_with_trd_error_code() {
     let stored = jobs.get("job_e2e_empty").unwrap().expect("job stored");
     assert_eq!(stored.status, JobStatus::Failed);
     assert!(stored.error.is_some());
+    assert_eq!(stored.error_code.as_deref(), Some("EMPTY_DATASET"));
+    assert_eq!(stored.failed_stage.as_deref(), Some("NORMALIZING"));
 
     // TRD §9: job.failed event emitted with the classified error code.
-    let events = emitter.events.lock().unwrap();
-    let failed: Vec<_> = events
-        .iter()
-        .filter_map(|e| match e {
-            PipelineEvent::VectorTileJobFailed { error_code, .. } => Some(error_code.clone()),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(failed, vec!["EMPTY_DATASET".to_string()]);
+    assert_eq!(failed_event_codes(&emitter), vec!["EMPTY_DATASET".to_string()]);
 }
 
 #[test]
@@ -289,6 +333,7 @@ fn point_assets_end_to_end() {
         jobs: jobs.clone(),
         catalog: catalog.clone(),
         events: Arc::new(NullEventEmitter),
+        quarantine: None,
     };
 
     let mut job = parcel_job("job_e2e_assets");
@@ -342,4 +387,299 @@ fn point_assets_end_to_end() {
         assert!(layer.geom_types.iter().all(|t| *t == 1));
         assert!(layer.keys.iter().any(|k| k == "assetId"));
     }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Fixture-library tests (Recommendation 1 US-02, Recommendation 2/3 paths)
+// ────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn fixture_simple_parcels_end_to_end() {
+    let root = temp_root("fx-parcels");
+    let d = deps(&root);
+    let jobs = d.jobs.clone();
+    let catalog = d.catalog.clone();
+
+    let job = parcel_job("job_fx_parcels");
+    jobs.create(job.clone()).unwrap();
+    let input = RunJobInput {
+        job,
+        source_bytes: fs::read(fixture("simple-parcels.geojson")).unwrap(),
+        tile_config: tile_config(),
+        normalize_opts: normalize_opts(),
+        paths: job_paths_for(&root, TENANT, "job_fx_parcels", LAYER),
+    };
+
+    let outcome = run_job(&input, &deps(&root)).expect("fixture job should succeed");
+    assert_eq!(outcome.feature_count, 3);
+    assert!(outcome.tile_count >= 4, "at least one tile per zoom 12..=15");
+
+    // Tiles decode and carry CRE identifiers without PII.
+    let mut tile_files = Vec::new();
+    collect_pbf(
+        &input.paths.tiles_root.join(&outcome.tile_version),
+        &mut tile_files,
+    );
+    assert!(!tile_files.is_empty());
+    for file in &tile_files {
+        let decoded = decode_gzipped_tile(&fs::read(file).unwrap()).expect("tile must decode");
+        let layer = &decoded.layers[0];
+        assert_eq!(layer.name, "parcel_boundary");
+        assert!(layer.geom_types.iter().all(|t| *t == 3));
+        assert!(
+            !layer.keys.iter().any(|k| k.eq_ignore_ascii_case("ownername")),
+            "ownerName must be stripped before publication"
+        );
+    }
+
+    // `latest.json` published atomically alongside the manifest.
+    let latest = TileManifest::from_json(
+        &fs::read_to_string(input.paths.latest_path()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(latest.tile_version, outcome.tile_version);
+
+    // Completed job has no failure markers.
+    let stored = jobs.get("job_fx_parcels").unwrap().unwrap();
+    assert_eq!(stored.status, JobStatus::Completed);
+    assert!(stored.error.is_none());
+    assert!(stored.failed_stage.is_none());
+    let layer = catalog.get(LAYER).unwrap().unwrap();
+    assert_eq!(layer.feature_count, 3);
+}
+
+#[test]
+fn fixture_invalid_polygon_fails_and_quarantines() {
+    let root = temp_root("fx-invalid");
+    let d = deps(&root);
+    let jobs = d.jobs.clone();
+    let emitter = Arc::new(CapturingEmitter::default());
+
+    let job = parcel_job("job_fx_invalid");
+    jobs.create(job.clone()).unwrap();
+    let input = RunJobInput {
+        job: job.clone(),
+        source_bytes: fs::read(fixture("invalid-polygon.geojson")).unwrap(),
+        tile_config: tile_config(),
+        normalize_opts: normalize_opts(),
+        paths: job_paths_for(&root, TENANT, "job_fx_invalid", LAYER),
+    };
+
+    let run_deps = JobDeps {
+        jobs: d.jobs.clone(),
+        catalog: d.catalog.clone(),
+        events: emitter.clone(),
+        quarantine: d.quarantine.clone(),
+    };
+    let err = run_job(&input, &run_deps).expect_err("invalid polygon must fail");
+    assert!(err.to_string().contains("geometry"), "got: {err}");
+
+    // Taxonomy + failed stage persisted on the job record.
+    let stored = jobs.get("job_fx_invalid").unwrap().unwrap();
+    assert_eq!(stored.status, JobStatus::Failed);
+    assert_eq!(stored.error_code.as_deref(), Some("GEOMETRY_ERRORS"));
+    assert_eq!(stored.failed_stage.as_deref(), Some("NORMALIZING"));
+    assert_eq!(failed_event_codes(&emitter), vec!["GEOMETRY_ERRORS".to_string()]);
+
+    // Quarantine (Recommendation 3 US-03): input + error report retained.
+    let qdir = root.join("quarantine").join(TENANT).join("job_fx_invalid");
+    assert!(qdir.join(INPUT_FILE_NAME).exists(), "input.bin quarantined");
+    let report: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(qdir.join(REPORT_FILE_NAME)).unwrap()).unwrap();
+    assert_eq!(report["errorCode"], "GEOMETRY_ERRORS");
+    assert_eq!(report["failedStage"], "NORMALIZING");
+    assert_eq!(report["jobId"], "job_fx_invalid");
+    assert_eq!(report["tenantId"], TENANT);
+}
+
+#[test]
+fn shapefile_bundle_end_to_end() {
+    let root = temp_root("fx-shapefile");
+    let d = deps(&root);
+    let jobs = d.jobs.clone();
+    let catalog = d.catalog.clone();
+
+    let mut job = parcel_job("job_fx_shp");
+    job.source_format = SourceFormat::Shapefile;
+    jobs.create(job.clone()).unwrap();
+    let input = RunJobInput {
+        job,
+        source_bytes: sample_parcel_bundle(true, true),
+        tile_config: tile_config(),
+        normalize_opts: normalize_opts(),
+        paths: job_paths_for(&root, TENANT, "job_fx_shp", LAYER),
+    };
+
+    let outcome = run_job(&input, &deps(&root)).expect("shapefile job should succeed");
+    assert_eq!(outcome.feature_count, 3);
+    assert!(outcome.tile_count >= 4);
+
+    // Attributes survived the DBF round-trip into MVT keys.
+    let mut tile_files = Vec::new();
+    collect_pbf(
+        &input.paths.tiles_root.join(&outcome.tile_version),
+        &mut tile_files,
+    );
+    assert!(!tile_files.is_empty());
+    let mut saw_parcel_id = false;
+    for file in &tile_files {
+        let decoded = decode_gzipped_tile(&fs::read(file).unwrap()).expect("tile must decode");
+        let layer = &decoded.layers[0];
+        assert!(layer.geom_types.iter().all(|t| *t == 3));
+        if layer.keys.iter().any(|k| k == "PARCELID") {
+            saw_parcel_id = true;
+        }
+    }
+    assert!(saw_parcel_id, "PARCELID attribute must reach the tiles");
+
+    let stored = jobs.get("job_fx_shp").unwrap().unwrap();
+    assert_eq!(stored.status, JobStatus::Completed);
+    let layer = catalog.get(LAYER).unwrap().unwrap();
+    assert_eq!(layer.source_format, SourceFormat::Shapefile);
+    assert!(!layer.assumed_crs, "prj present, CRS detected not assumed");
+}
+
+#[test]
+fn missing_dbf_fails_with_component_error_and_quarantines() {
+    let root = temp_root("fx-missing-dbf");
+    let d = deps(&root);
+    let jobs = d.jobs.clone();
+
+    let mut job = parcel_job("job_fx_nodb");
+    job.source_format = SourceFormat::Shapefile;
+    jobs.create(job.clone()).unwrap();
+    let input = RunJobInput {
+        job,
+        source_bytes: sample_parcel_bundle(false, true),
+        tile_config: tile_config(),
+        normalize_opts: normalize_opts(),
+        paths: job_paths_for(&root, TENANT, "job_fx_nodb", LAYER),
+    };
+
+    let err = run_job(&input, &deps(&root)).expect_err("missing .dbf must fail");
+    assert!(err.to_string().contains(".dbf"), "got: {err}");
+
+    // TRD §9 example: "Missing required .dbf file." → machine-readable code.
+    let stored = jobs.get("job_fx_nodb").unwrap().unwrap();
+    assert_eq!(stored.status, JobStatus::Failed);
+    assert_eq!(
+        stored.error_code.as_deref(),
+        Some("MISSING_SHAPEFILE_COMPONENTS")
+    );
+    assert_eq!(stored.failed_stage.as_deref(), Some("NORMALIZING"));
+
+    let qdir = root.join("quarantine").join(TENANT).join("job_fx_nodb");
+    assert!(qdir.join(INPUT_FILE_NAME).exists());
+    assert!(qdir.join(REPORT_FILE_NAME).exists());
+}
+
+#[test]
+fn missing_prj_fails_then_replays_with_assumed_wgs84() {
+    let root = temp_root("fx-replay");
+    let d = deps(&root);
+    let jobs = d.jobs.clone();
+    let catalog = d.catalog.clone();
+    let job_id = "job_fx_replay";
+
+    let mut job = parcel_job(job_id);
+    job.source_format = SourceFormat::Shapefile;
+    jobs.create(job.clone()).unwrap();
+    let input = RunJobInput {
+        job,
+        source_bytes: sample_parcel_bundle(true, false), // no .prj
+        tile_config: tile_config(),
+        normalize_opts: normalize_opts(), // RequireKnown
+        paths: job_paths_for(&root, TENANT, job_id, LAYER),
+    };
+
+    // 1. First attempt fails: unknown CRS requires explicit confirmation.
+    let err = run_job(&input, &deps(&root)).expect_err("missing .prj must fail");
+    assert!(err.to_string().contains("CRS") || err.to_string().contains(".prj"), "got: {err}");
+    let stored = jobs.get(job_id).unwrap().unwrap();
+    assert_eq!(stored.status, JobStatus::Failed);
+    assert_eq!(stored.error_code.as_deref(), Some("UNKNOWN_CRS"));
+    assert!(root
+        .join("quarantine")
+        .join(TENANT)
+        .join(job_id)
+        .join(INPUT_FILE_NAME)
+        .exists());
+
+    // 2. Replay with the user's WGS84 confirmation (Recommendation 3 US-03).
+    let outcome = replay_job(
+        &deps(&root),
+        &root,
+        TENANT,
+        job_id,
+        &ReplayOptions {
+            assume_wgs84: true,
+        },
+    )
+    .expect("replay with assume-wgs84 should succeed");
+    assert_eq!(outcome.feature_count, 3);
+
+    let stored = jobs.get(job_id).unwrap().unwrap();
+    assert_eq!(stored.status, JobStatus::Completed);
+    assert!(stored.error.is_none());
+    assert!(stored.error_code.is_none());
+    assert!(stored.failed_stage.is_none());
+
+    // Replay published a fresh tile version and swapped the live pointer.
+    let latest = TileManifest::from_json(
+        &fs::read_to_string(input.paths.latest_path()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(latest.tile_version, outcome.tile_version);
+    let layer = catalog.get(LAYER).unwrap().unwrap();
+    assert!(layer.assumed_crs, "assumed CRS must be flagged in metadata");
+}
+
+#[test]
+fn replay_rejects_non_failed_and_unknown_jobs() {
+    let root = temp_root("fx-replay-guard");
+    let d = deps(&root);
+
+    // Unknown job → descriptive error, not a panic.
+    let err = replay_job(&deps(&root), &root, TENANT, "job_missing", &ReplayOptions::default())
+        .expect_err("unknown job must fail");
+    assert!(err.to_string().contains("no quarantined input"));
+
+    // A QUEUED (non-FAILED) job cannot be replayed even if quarantine data
+    // exists for its id.
+    let job = parcel_job("job_fx_guard");
+    d.jobs.create(job.clone()).unwrap();
+    let store = FileQuarantineStore::new(root.join("quarantine"));
+    let report = vtile_pipeline::ErrorReport::from_job(&job, "UNKNOWN_CRS", "x", "NORMALIZING");
+    store
+        .quarantine(&job, b"{}", &report)
+        .expect("quarantine write");
+    use vtile_pipeline::QuarantineStore;
+    let err = replay_job(&deps(&root), &root, TENANT, "job_fx_guard", &ReplayOptions::default())
+        .expect_err("queued job must not replay");
+    assert!(err.to_string().contains("FAILED"), "got: {err}");
+}
+
+#[test]
+fn feature_count_cap_enforced_before_tiling() {
+    let root = temp_root("fx-cap");
+    let d = deps(&root);
+    let jobs = d.jobs.clone();
+
+    let job = parcel_job("job_fx_cap");
+    jobs.create(job.clone()).unwrap();
+    let mut opts = normalize_opts();
+    opts.max_features = 2; // fixture has 3 features
+    let input = RunJobInput {
+        job,
+        source_bytes: fs::read(fixture("simple-parcels.geojson")).unwrap(),
+        tile_config: tile_config(),
+        normalize_opts: opts,
+        paths: job_paths_for(&root, TENANT, "job_fx_cap", LAYER),
+    };
+
+    let err = run_job(&input, &deps(&root)).expect_err("over-cap dataset must fail");
+    assert!(err.to_string().contains("exceeds limit"), "got: {err}");
+    let stored = jobs.get("job_fx_cap").unwrap().unwrap();
+    assert_eq!(stored.status, JobStatus::Failed);
+    assert_eq!(stored.error_code.as_deref(), Some("FILE_TOO_LARGE"));
 }
