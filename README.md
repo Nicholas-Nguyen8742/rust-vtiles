@@ -199,12 +199,14 @@ production cutover checklist.
 | §13 security (tenant isolation, CORS, SSE-KMS, PII) | `vtile-api/src/auth.rs`, property denylist, `terraform/kms.tf` |
 | §14 NFRs (idempotency, atomic publish/rollback, retries) | `job.rs` idempotency guard, manifest swap, SQS redrive ×3 |
 | DLQ/quarantine/replay workflow | `vtile-pipeline/src/{quarantine,replay}.rs` |
+| Idempotent job processing (identity, dedupe, leases, replay guardrails, telemetry) | `vtile-pipeline/src/{idempotency,store}.rs`, `docs/IDEMPOTENCY.md` |
 | Local dev loop (make targets, fixtures, smoke) | `Makefile`, `scripts/`, `docs/LOCAL_DEV.md` |
 
 ## Documentation
 
 - [`docs/LOCAL_DEV.md`](docs/LOCAL_DEV.md) — local pipeline walkthrough: make targets, data layout, job lifecycle, failure/replay, Docker
 - [`docs/ERRORS.md`](docs/ERRORS.md) — the error taxonomy: codes, HTTP statuses, failed stages, quarantine + replay semantics
+- [`docs/IDEMPOTENCY.md`](docs/IDEMPOTENCY.md) — idempotent job processing: identity keys, duplicate-event suppression, leases, replay guardrails, telemetry
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — component map, workflow, storage layout, production cutover
 - [`docs/MVT.md`](docs/MVT.md) — the MVT v2 wire format and how the encoder works
 - [`docs/PRECISION.md`](docs/PRECISION.md) — 7-decimal requirement vs. MVT quantization per zoom (read this before trusting tile geometry for measurement)
