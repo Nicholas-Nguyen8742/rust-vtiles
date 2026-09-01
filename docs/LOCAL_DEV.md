@@ -71,6 +71,8 @@ data/                                  # local mirror of TRD §6 S3 prefixes
   quarantine/{tenantId}/{jobId}/
     input.bin                          # original upload bytes
     error-report.json                  # ErrorReport (code, stage, message, ...)
+  dedupe/{sha256_fingerprint}.json     # accepted-event dedupe records (Sequence 1 US-03)
+  orphans/{timestamp}-{hash}.json      # events with no resolvable job (US-01/US-03)
   jobs/{jobId}.json                    # job records (DynamoDB stand-in)
   catalog.json                         # layer catalog (DynamoDB stand-in)
 ```
@@ -82,6 +84,9 @@ by one are visible to the other.
 
 States are the TRD §10 workflow, persisted to `data/jobs/{jobId}.json` at
 every transition. `failedStage` on a failed job names the stage that errored.
+Every write bumps `stateVersion`, and runs hold a 15-minute worker lease
+(`leaseToken`/`lockedBy`/`leaseExpiresAt`) so only one processor owns a job
+at a time — see [`IDEMPOTENCY.md`](IDEMPOTENCY.md).
 
 ```mermaid
 stateDiagram-v2
@@ -103,9 +108,11 @@ stateDiagram-v2
 ## HTTP walkthrough
 
 ```bash
-# 1. Create the job (TRD §8.1)
+# 1. Create the job (TRD §8.1); optional Idempotency-Key header makes
+#    repeat requests converge on the same job (Sequence 1 US-01)
 curl -s -X POST localhost:8080/api/v1/ingest/uploads \
   -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: nyc-parcels-2026-06-17' \
   -d '{"tenantId":"tenant-acme","layerId":"us-parcels-fx",
        "fileName":"simple-parcels.geojson","contentType":"application/geo+json",
        "sourceFormat":"GEOJSON",
@@ -144,13 +151,21 @@ cat data/quarantine/tenant-acme/<jobId>/error-report.json
 # missing-prj.zip fails with UNKNOWN_CRS; replay it with user-confirmed WGS84
 # (TRD §10 "require user confirmation"):
 make replay-job TENANT=tenant-acme JOB_ID=<jobId> ASSUME_WGS84=1
+
+# replays record who/why (Sequence 1 US-05):
+vtile replay --data-dir ./data --tenant tenant-acme --job-id <jobId> \
+  --requested-by sre-user --reason "Transient Fargate timeout" --assume-wgs84
 ```
 
-Replay semantics (Recommendation 3 US-03): only `FAILED` jobs can be replayed,
-the tenant must match, the job re-enters at `QUEUED` with its error fields
-cleared, and each run mints a fresh `tileVersion` swapped in atomically — so a
-replay either publishes a complete new version or leaves the previous one
-untouched. `COMPLETED` jobs are never replayed (idempotency guard).
+Replay semantics (Recommendation 3 US-03, Sequence 1 US-05): `FAILED` jobs
+replay; `COMPLETED` jobs replay only with `--create-new-version`; active jobs
+are rejected with `JOB_ALREADY_ACTIVE`; `CANCELLED` jobs never replay. The
+tenant must match, the job re-enters at `QUEUED` with its error fields and
+stale lease cleared, an audit record (`replayAudit`) is persisted, and
+each run mints a fresh `tileVersion` swapped in atomically — so a replay
+either publishes a complete new version or leaves the previous one
+untouched. Duplicate uploads and redelivered events are suppressed
+automatically; the counters are visible at `GET /internal/metrics`.
 
 ## CLI reference (`vtile`)
 
@@ -162,7 +177,8 @@ vtile run --tenant tenant-acme --layer us-parcels-nyc \
     --category parcel [--min-zoom 10 --max-zoom 16] [--assume-wgs84] [--normalize-only]
 vtile inspect-tile ./data/tiles/.../14/4824/6157.pbf
 vtile job-status --data-dir ./data --job-id job_...
-vtile replay --data-dir ./data --tenant tenant-acme --job-id job_... --assume-wgs84
+vtile replay --data-dir ./data --tenant tenant-acme --job-id job_... \
+    [--assume-wgs84] [--requested-by NAME] [--reason TEXT] [--create-new-version]
 ```
 
 `--normalize-only` stops after the normalization artifact (states 1–7) and
@@ -202,11 +218,18 @@ Environment:
 | `TENANT` | `tenant-acme` | scripts/seed.sh, scripts/smoke.sh |
 | `AWS_ENDPOINT_URL`, `AWS_*` | — | only with `--features aws` (S3 sink) |
 
+Ops endpoint: `GET /internal/metrics` returns the idempotency telemetry
+snapshot (Sequence 1 US-06); `make metrics` wraps it.
+
 ## Parity notes
 
 - **Same contracts, different transports.** Request/response shapes, the
   tile status-code contract, event payloads, and the error taxonomy
   (`docs/ERRORS.md`) match production exactly; only the transport differs.
+- **Idempotency is real, the store is emulated.** Conditional creates,
+  version-checked transitions, leases, dedupe, orphan handling, and replay
+  guardrails run in-process against the filesystem; DynamoDB provides the
+  atomic conditionals in production (`docs/IDEMPOTENCY.md`).
 - **No real queue.** The PUT handler starts processing in-process; the TRD
   "job start < 30 s" NFR is trivially met locally.
 - **File stores instead of DynamoDB.** Single-file catalog (`catalog.json`) —

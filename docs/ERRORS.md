@@ -74,10 +74,10 @@ These never reach the pipeline; they enforce the TRD §8/§13 contracts.
 |---|---:|---|---|
 | `INVALID_REQUEST` | 400 | `POST /ingest/uploads` | Missing `tenantId` or `layerId` |
 | `UNSUPPORTED_FORMAT` | 422 | `POST /ingest/uploads` | `sourceFormat` outside MVP (GeoJSON/Shapefile only; KML/GeoPackage/FlatGeobuf are post-MVP) |
+| `IDEMPOTENCY_KEY_PAYLOAD_MISMATCH` | 409 | `POST /ingest/uploads` | `Idempotency-Key` reused with a different payload (Sequence 1 US-02) — fix the payload or mint a new key |
 | `UNAUTHORIZED` | 401 | any (auth enabled) | Missing/invalid bearer token |
 | `FORBIDDEN` | 403 | jobs, tiles | Token tenant does not match the resource tenant (TRD §13 isolation) |
-| `JOB_NOT_FOUND` | 404 | `GET /jobs/{id}`, content PUT | Unknown job id |
-| `JOB_TERMINAL` | 409 | content PUT | Upload into an already-terminal job |
+| `JOB_NOT_FOUND` | 404 | `GET /jobs/{id}`, content PUT | Unknown job id; content PUTs for unknown jobs are also recorded under `data/orphans/` (Sequence 1 US-03) |
 | `LAYER_NOT_FOUND` | 404 | layers, tiles | Unknown layer, or another tenant's layer (existence is not leaked) |
 | `LAYER_NOT_PUBLISHED` | 404 | tiles | Layer exists but has no manifest (never published) |
 | `ZOOM_OUT_OF_RANGE` | 422 | tiles | `z` outside the layer's published range or beyond the tile grid (TRD §8.5) |
@@ -86,6 +86,25 @@ These never reach the pipeline; they enforce the TRD §8/§13 contracts.
 The tile endpoint additionally returns **`204 No Content` for empty tiles** —
 not an error, per TRD §8.5/US-03, so map clients do not treat voids as
 failures.
+
+Content PUTs for jobs that are **already active or terminal** return a
+**`202` acknowledgment** and increment `duplicateEventCount` instead of
+starting new work (Sequence 1 US-03 duplicate-event suppression). The
+`vector.tile.job.replay_requested` audit event (replay operations) is
+documented in [`IDEMPOTENCY.md`](IDEMPOTENCY.md).
+
+## Idempotency and concurrency errors (Sequence 1)
+
+These surface through `job.failed` classification as `PIPELINE_ERROR` (HTTP
+500) at the API boundary, but are distinct in the pipeline and tests; full
+semantics in [`IDEMPOTENCY.md`](IDEMPOTENCY.md).
+
+| Error | Meaning | Operator action |
+|---|---|---|
+| `JobAlreadyExists` | Conditional create lost — the `jobId` is already registered | Converge on the existing record via the idempotency key (automatic in the API) |
+| `StateConflict` | Conditional transition rejected: stale expected status or illegal edge | Inspect `stateVersion` history; usually a redelivery race — retry |
+| `LeaseConflict` | Job owned by another worker's active lease | Back off; the owning worker finishes or the lease expires (900 s) |
+| `JobAlreadyActive` | Replay attempted while the job is still processing (`JOB_ALREADY_ACTIVE`) | Wait for the terminal state, then replay if still needed |
 
 ## Quarantine and replay
 
@@ -99,15 +118,23 @@ data/quarantine/{tenantId}/{jobId}/
                      #   failedStage, quarantinedAt }
 ```
 
-Replay (`vtile replay` / `make replay-job`) semantics:
+Replay (`vtile replay` / `make replay-job`) semantics — Sequence 1 US-05
+hardening:
 
-1. Only jobs in `FAILED` state, with a quarantine entry, and a matching
-   tenant can be replayed.
-2. The job is reset to `QUEUED` with `error`/`errorCode`/`failedStage`
-   cleared, then re-runs the full workflow from the quarantined bytes.
-3. Each run mints a **fresh `tileVersion`** and swaps `manifest.json` /
+1. Replay rules by stored status: `FAILED` → allowed (canonical DLQ
+   redrive); `COMPLETED` → allowed only with `--create-new-version`;
+   active jobs → rejected with `JobAlreadyActive` (`JOB_ALREADY_ACTIVE`);
+   `CANCELLED` → rejected.
+2. Tenant must match; replays never cross tenant boundaries.
+3. Source bytes resolve from the quarantine first; when absent
+   (completed-job re-publish) they fall back to the staged upload.
+4. Every replay emits `vector.tile.job.replay_requested` (`requestedBy`,
+   `reason`, `createNewVersion`) and persists a `ReplayAudit` on the job.
+5. The job is reset to `QUEUED` with `error`/`errorCode`/`failedStage` and
+   any stale lease cleared, then re-runs the full workflow.
+6. Each run mints a **fresh `tileVersion`** and swaps `manifest.json` /
    `latest.json` atomically — replay either publishes a complete new version
    or leaves the previous one untouched (TRD §14: "DLQ replay must not
    duplicate published tiles").
-4. For `UNKNOWN_CRS` failures, `--assume-wgs84` is the TRD §10 "user
+7. For `UNKNOWN_CRS` failures, `--assume-wgs84` is the TRD §10 "user
    confirmation" that unlocks the retry.
