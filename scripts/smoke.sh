@@ -113,6 +113,20 @@ if [ "$STATUS" = "COMPLETED" ]; then
         say_fail "GET covered tile 14/$X/$Y (HTTP $code, wanted 200)"
     fi
 
+    # Sequence 2 US-AP-04: the same tile through the explicit-version URL.
+    VERSION="$(python3 -c "import json; print(json.load(open('$DATA_DIR/manifests/$TENANT/$LAYER/latest.json'))['tileVersion'])" 2>/dev/null || echo "")"
+    if [ -n "$VERSION" ]; then
+        code="$(curl -s -o /dev/null -w '%{http_code}' \
+            "$API_BASE/tiles/$TENANT/$LAYER/versions/$VERSION/14/$X/$Y.pbf")"
+        if [ "$code" = "200" ]; then
+            say_pass "GET versioned tile $VERSION 14/$X/$Y (HTTP 200)"
+        else
+            say_fail "GET versioned tile $VERSION 14/$X/$Y (HTTP $code, wanted 200)"
+        fi
+    else
+        say_fail "latest.json missing or unreadable (no tileVersion)"
+    fi
+
     # Zoom below the published PARCEL range (min 10) -> 422.
     code="$(curl -s -o /dev/null -w '%{http_code}' \
         "$API_BASE/tiles/$TENANT/$LAYER/3/2/3.pbf")"

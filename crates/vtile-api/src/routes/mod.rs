@@ -3,6 +3,7 @@
 pub mod health;
 pub mod jobs;
 pub mod layers;
+pub mod ops;
 pub mod tiles;
 pub mod uploads;
 

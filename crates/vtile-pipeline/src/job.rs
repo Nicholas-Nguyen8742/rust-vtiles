@@ -24,6 +24,7 @@ use vtile_ingest::normalize::{
 use crate::error::{PipelineError, PipelineResult};
 use crate::events::{EventEmitter, PipelineEvent};
 use crate::manifest::TileManifest;
+use crate::publish::{self, CandidateManifest};
 use crate::quarantine::{ErrorReport, QuarantineStore};
 use crate::sink_local::LocalTileSink;
 use crate::store::{JobStore, LayerCatalog};
@@ -52,6 +53,12 @@ impl JobPaths {
     /// (Recommendation 2 US-04); identical content to `manifest.json`.
     pub fn latest_path(&self) -> PathBuf {
         self.manifests_root.join("latest.json")
+    }
+
+    /// Immutable candidate directory for a tile version (Sequence 2
+    /// US-AP-01): `tiles/{tenantId}/{layerId}/versions/{tileVersion}/`.
+    pub fn version_root(&self, tile_version: &str) -> PathBuf {
+        publish::version_root(&self.tiles_root, tile_version)
     }
 }
 
@@ -134,11 +141,33 @@ pub fn run_job(input: &RunJobInput, deps: &JobDeps) -> PipelineResult<JobOutcome
 
     // Tracks the workflow stage so failures can report `failedStage`.
     let mut stage = JobStatus::Queued;
-    match run_job_inner(input, deps, &mut stage, &lease.lease_token) {
+    // Sequence 2: the candidate version is minted up front so publish
+    // failures can be reported against it.
+    let tile_version = new_tile_version();
+    match run_job_inner(input, deps, &mut stage, &lease.lease_token, &tile_version) {
         Ok(outcome) => Ok(outcome),
         Err(err) => {
             let (code, message) = error_classification(&err);
             let failed_stage = stage.as_str().to_string();
+
+            // Sequence 2 US-AP-06: publish-stage failures get dedicated
+            // telemetry; the previous published version stays active.
+            if matches!(err, PipelineError::PublishValidation(_)) {
+                publish::PublishMetrics::global()
+                    .inc(publish::PublishMetric::PublishValidationFailures);
+            }
+            if failed_stage == JobStatus::Publishing.as_str() {
+                deps.events.emit(PipelineEvent::VectorTilePublishFailed {
+                    event_id: new_event_id(),
+                    tenant_id: job.tenant_id.clone(),
+                    layer_id: job.layer_id.clone(),
+                    job_id: job.job_id.clone(),
+                    tile_version: tile_version.clone(),
+                    error_code: code.clone(),
+                    error_message: message.clone(),
+                    occurred_at: Utc::now(),
+                });
+            }
 
             // Persist the failure with taxonomy code + failed stage
             // (Recommendation 3 US-02), releasing the lease (US-04).
@@ -202,10 +231,12 @@ fn run_job_inner(
     deps: &JobDeps,
     stage: &mut JobStatus,
     lease_token: &str,
+    tile_version: &str,
 ) -> PipelineResult<JobOutcome> {
     let job = &input.job;
     let paths = &input.paths;
     let mut warnings: Vec<String> = Vec::new();
+    let tile_version = tile_version.to_string();
 
     // ── 1. Validate upload ────────────────────────────────────────────────
     advance_stage(deps, &job.job_id, lease_token, stage, JobStatus::Validating)?;
@@ -247,7 +278,6 @@ fn run_job_inner(
 
     // ── 8. Generate vector tiles ──────────────────────────────────────────
     advance_stage(deps, &job.job_id, lease_token, stage, JobStatus::Tiling)?;
-    let tile_version = new_tile_version();
     let raw_features: Vec<RawFeature> = dataset
         .features
         .iter()
@@ -262,7 +292,9 @@ fn run_job_inner(
         return Err(PipelineError::Job("no tileable features after preparation".into()));
     }
 
-    let sink_root = paths.tiles_root.join(&tile_version);
+    // Sequence 2 US-AP-01: candidate tiles land under the immutable version
+    // path — never on the live read path.
+    let sink_root = paths.version_root(&tile_version);
     let sink = LocalTileSink::new(&sink_root);
     let meta = TileObjectMeta {
         tenant_id: job.tenant_id.clone(),
@@ -281,27 +313,56 @@ fn run_job_inner(
         "tile generation complete"
     );
 
-    // ── 9/10. Publish tiles + write manifest ──────────────────────────────
+    // ── 9/10. Atomic publish (Sequence 2): candidate → validate → promote ─
     advance_stage(deps, &job.job_id, lease_token, stage, JobStatus::Publishing)?;
-    let manifest = TileManifest {
-        schema_version: crate::manifest::MANIFEST_SCHEMA_VERSION,
+
+    // US-AP-01/02: the candidate manifest records completeness + integrity
+    // before the version can become visible.
+    let candidate = CandidateManifest {
+        schema_version: publish::CANDIDATE_MANIFEST_SCHEMA_VERSION,
         tenant_id: job.tenant_id.clone(),
         layer_id: job.layer_id.clone(),
         tile_version: tile_version.clone(),
+        status: "CANDIDATE".to_string(),
+        source_job_id: job.job_id.clone(),
+        source_format: job.source_format.as_str().to_string(),
+        crs: "EPSG:4326".to_string(),
         min_zoom: input.tile_config.zoom_range.min_zoom,
         max_zoom: input.tile_config.zoom_range.max_zoom,
+        feature_count: prepared.feature_count(),
         tile_count: stats.tiles_written,
         total_gzip_bytes: stats.total_gzip_bytes,
         bounding_box: bbox,
         generated_at: Utc::now(),
-        tile_url_template: None,
+        checksum_algorithm: "SHA-256".to_string(),
+        aggregate_checksum: publish::aggregate_checksum(&sink.entries()),
+        tile_root: format!(
+            "tiles/{}/{}/versions/{tile_version}/",
+            job.tenant_id, job.layer_id
+        ),
     };
-    fs::create_dir_all(&paths.manifests_root)?;
-    fs::write(paths.manifest_path(), manifest.to_json()?)?;
-    // Atomic live pointer (Recommendation 2 US-04): `latest.json` mirrors the
-    // manifest and is written via tmp + rename so readers never observe a
-    // partial document.
-    write_latest_pointer(paths, &manifest)?;
+    publish::write_candidate_manifest(&paths.tiles_root, &candidate)?;
+
+    // US-AP-03: conditional promotion — verifies completeness, then moves
+    // the authoritative pointer only if the layer's current version is still
+    // what we observed. On any failure the previous version stays active.
+    let expected_previous = publish::FileLayerRegistry::new(&paths.manifests_root)
+        .get()?
+        .map(|r| r.current_tile_version);
+    publish::promote_layer_version(
+        &paths.tiles_root,
+        &paths.manifests_root,
+        &candidate,
+        expected_previous.as_deref(),
+        publish::PIPELINE_ACTOR,
+        deps.events.as_ref(),
+    )?;
+    let manifest = publish::tile_manifest_from_candidate(&candidate);
+    info!(
+        version = %tile_version,
+        previous = ?expected_previous,
+        "layer version promoted atomically"
+    );
 
     // ── 11. Update catalog ────────────────────────────────────────────────
     let layer_input = job.layer_input.clone().unwrap_or_default();
@@ -327,6 +388,10 @@ fn run_job_inner(
         security_classification: SecurityClassification::Internal,
         published_at: Some(Utc::now()),
         tile_version: tile_version.clone(),
+        tile_url_template: Some(publish::tile_url_template_for(
+            &job.tenant_id,
+            &job.layer_id,
+        )),
         assumed_crs: dataset.crs.assumed,
     };
     deps.catalog.upsert(layer_meta)?;
@@ -403,17 +468,12 @@ pub fn error_classification(err: &PipelineError) -> (String, String) {
             _ => "TILE_GENERATION_FAILED",
         },
         PipelineError::Store(_) => "STORE_ERROR",
+        PipelineError::PublishValidation(_) => "PUBLISH_VALIDATION_FAILED",
+        PipelineError::PromotionConflict(_) => "PROMOTION_CONFLICT",
+        PipelineError::RollbackFailed(_) => "ROLLBACK_FAILED",
         _ => "PIPELINE_ERROR",
     };
     (code.to_string(), err.to_string())
-}
-
-/// Writes `latest.json` alongside `manifest.json` (tmp + rename).
-pub fn write_latest_pointer(paths: &JobPaths, manifest: &TileManifest) -> PipelineResult<()> {
-    let tmp = paths.latest_path().with_extension("json.tmp");
-    fs::write(&tmp, manifest.to_json()?)?;
-    fs::rename(&tmp, paths.latest_path())?;
-    Ok(())
 }
 
 /// TRD layer-naming convention `{source}_{type}` (US-09) for MVT layer
@@ -431,9 +491,19 @@ pub fn default_mvt_layer_name(category: Option<LayerCategory>, layer_id: &str) -
     }
 }
 
-/// Tile version stamp in the TRD example format (`2026-06-17T14-30-00Z`).
+/// Tile version stamp: TRD-format timestamp plus a short unique suffix.
+///
+/// TRD open question 3 leaves the versioning scheme open; a pure
+/// second-resolution timestamp would collide when two runs of the same
+/// layer land in the same second, so the suffix guarantees candidate-path
+/// uniqueness (Sequence 2 US-AP-01).
 pub fn new_tile_version() -> String {
-    Utc::now().format("%Y-%m-%dT%H-%M-%SZ").to_string()
+    let suffix = uuid::Uuid::new_v4().as_simple().to_string();
+    format!(
+        "{}-{}",
+        Utc::now().format("%Y-%m-%dT%H-%M-%SZ"),
+        &suffix[..8]
+    )
 }
 
 /// Worker lease TTL (Sequence 1 US-04): matches the TRD Fargate hard limit

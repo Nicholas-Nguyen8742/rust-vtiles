@@ -100,3 +100,12 @@ pub struct LayerListQuery {
     #[serde(default)]
     pub market: Option<String>,
 }
+
+/// `POST /api/v1/ops/layers/{layerId}/rollback` request (Sequence 2
+/// US-AP-05). `reason` is mandatory for SOC2-aligned auditability.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RollbackRequest {
+    pub target_tile_version: String,
+    pub reason: String,
+}

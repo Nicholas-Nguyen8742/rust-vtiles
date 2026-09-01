@@ -12,6 +12,8 @@
 //! vtile job-status --data-dir ./data --job-id job_...
 //! vtile replay --data-dir ./data --tenant tenant-acme --job-id job_... \
 //!     --assume-wgs84 --requested-by sre-user --reason "Transient Fargate timeout"
+//! vtile rollback --data-dir ./data --tenant tenant-acme --layer us-parcels-nyc \
+//!     --target-version 2026-06-17T14-30-00Z-abcd1234 --reason "Misaligned parcel refresh"
 //! ```
 
 use std::fs;
@@ -115,6 +117,27 @@ enum Command {
         #[arg(long, default_value_t = false)]
         create_new_version: bool,
     },
+    /// Roll back a layer to a previously published tile version
+    /// (Sequence 2 US-AP-05). Repoints the authoritative version record and
+    /// rewrites the manifests — no source reprocessing.
+    Rollback {
+        #[arg(long, default_value = "./data")]
+        data_dir: PathBuf,
+        #[arg(long)]
+        tenant: String,
+        #[arg(long)]
+        layer: String,
+        /// Tile version to restore (must be retained on disk with its
+        /// candidate manifest).
+        #[arg(long)]
+        target_version: String,
+        /// Reason recorded in the audit trail (mandatory, US-AP-06).
+        #[arg(long)]
+        reason: String,
+        /// Operator identity recorded in the audit trail.
+        #[arg(long, default_value = "cli")]
+        requested_by: String,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -200,6 +223,21 @@ fn main() -> Result<()> {
             requested_by,
             reason,
             create_new_version,
+        ),
+        Command::Rollback {
+            data_dir,
+            tenant,
+            layer,
+            target_version,
+            reason,
+            requested_by,
+        } => rollback(
+            data_dir,
+            tenant,
+            layer,
+            target_version,
+            reason,
+            requested_by,
         ),
     }
 }
@@ -367,7 +405,7 @@ fn run(
             "tileVersion": outcome.tile_version,
             "bbox": outcome.bbox.to_vec(),
             "warnings": outcome.warnings,
-            "tilesRoot": input.paths.tiles_root.join(&outcome.tile_version),
+            "tilesRoot": input.paths.version_root(&outcome.tile_version),
         })
     );
     Ok(())
@@ -435,6 +473,38 @@ fn replay(
             "warnings": outcome.warnings,
         })
     );
+    Ok(())
+}
+
+/// Rolls back a layer to a previously published tile version (Sequence 2
+/// US-AP-05) without reprocessing. Emits `vector.tile.version.rolled_back`
+/// and appends an audit record (US-AP-06).
+#[allow(clippy::too_many_arguments)]
+fn rollback(
+    data_dir: PathBuf,
+    tenant: String,
+    layer: String,
+    target_version: String,
+    reason: String,
+    requested_by: String,
+) -> Result<()> {
+    if reason.trim().is_empty() {
+        anyhow::bail!("--reason is required for rollback (auditability)");
+    }
+    let tiles_root = data_dir.join("tiles").join(&tenant).join(&layer);
+    let manifests_root = data_dir.join("manifests").join(&tenant).join(&layer);
+    let emitter = LoggingEventEmitter;
+    let record = vtile_pipeline::rollback_layer_version(
+        &tenant,
+        &layer,
+        &tiles_root,
+        &manifests_root,
+        &target_version,
+        &reason,
+        &requested_by,
+        &emitter,
+    )?;
+    println!("{}", serde_json::to_string_pretty(&record)?);
     Ok(())
 }
 

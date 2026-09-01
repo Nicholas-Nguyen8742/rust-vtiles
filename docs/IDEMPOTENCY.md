@@ -121,8 +121,9 @@ ownership, and bumps `stateVersion`. Violations return `StateConflict` /
 - The lease is released when the run settles (final record clears
   `leaseToken`/`lockedBy`/`leaseExpiresAt`).
 - **Versioned output isolation:** tiles land under
-  `tiles/{tenantId}/{layerId}/{tileVersion}/` and only a completed run swaps
-  the manifest — a crashed run can never expose partial tiles (TRD §14).
+  `tiles/{tenantId}/{layerId}/versions/{tileVersion}/` and only a validated,
+  promoted version moves the authoritative pointer — a crashed run can never
+  expose partial tiles (TRD §14; full lifecycle in `docs/PUBLISHING.md`).
 
 Local note: `FileJobStore` performs read-modify-write, so the *mechanism* is
 best-effort within one process; the *semantics* (version checks, lease

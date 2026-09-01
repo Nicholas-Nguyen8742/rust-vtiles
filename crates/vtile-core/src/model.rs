@@ -393,8 +393,13 @@ pub struct LayerMetadata {
     pub security_classification: SecurityClassification,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub published_at: Option<DateTime<Utc>>,
-    /// Current live tile version; tiles live under this version prefix.
+    /// Current live tile version; tiles live under
+    /// `tiles/{tenant}/{layer}/versions/{tile_version}/` (Sequence 2).
     pub tile_version: String,
+    /// Versioned client URL template (Sequence 2 US-AP-04), e.g.
+    /// `/tiles/{tenant}/{layer}/versions/{tileVersion}/{z}/{x}/{y}.pbf`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tile_url_template: Option<String>,
     /// True when the source CRS was missing and WGS84 was assumed (US-04).
     #[serde(default)]
     pub assumed_crs: bool,

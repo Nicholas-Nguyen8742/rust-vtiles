@@ -6,8 +6,12 @@
 //!   equivalent of the S3 presigned URL; prod swaps this for S3 direct upload)
 //! * `GET  /api/v1/jobs/:job_id` (§8.2)
 //! * `GET  /api/v1/layers` (§8.3), `GET /api/v1/layers/:layer_id` (§8.4)
-//! * `GET  /tiles/:tenant/:layer/:z/:x/:y.pbf` (§8.5)
-//! * `GET  /healthz`
+//! * `POST /api/v1/ops/layers/:layer_id/rollback` — atomic version rollback
+//!   (Sequence 2 US-AP-05)
+//! * `GET  /tiles/:tenant/:layer/:z/:x/:y.pbf` (§8.5),
+//!   `GET /tiles/:tenant/:layer/versions/:version/:z/:x/:y.pbf` (Sequence 2
+//!   US-AP-04 explicit-version read path)
+//! * `GET  /healthz`, `GET /internal/metrics` (idempotency + publish telemetry)
 //!
 //! Production mapping (TRD §2): API Gateway fronts these handlers, uploads go
 //! straight to S3 via presigned URLs, and the PUT handler is replaced by the
@@ -53,8 +57,16 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             get(routes::layers::get_layer),
         )
         .route(
+            "/api/v1/ops/layers/:layer_id/rollback",
+            post(routes::ops::rollback_layer),
+        )
+        .route(
             "/tiles/:tenant/:layer/:z/:x/:y",
             get(routes::tiles::get_tile),
+        )
+        .route(
+            "/tiles/:tenant/:layer/versions/:version/:z/:x/:y",
+            get(routes::tiles::get_tile_versioned),
         )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),

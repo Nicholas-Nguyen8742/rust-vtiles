@@ -19,10 +19,10 @@ swapping local → production is adapter work, not a rewrite.
 | Upload trigger | S3 event → SQS → Step Functions | PUT handler → in-process `run_job` |
 | Orchestration | Step Functions state machine | `vtile_pipeline::job::run_job` (same 12 states) |
 | Format conversion / tiling compute | ECS Fargate (GDAL/Tippecanoe) | `vtile-ingest` + `vtile-core` (pure Rust, no native deps) |
-| Published tiles | S3 tile bucket + CloudFront | `data/tiles/{tenant}/{layer}/{version}/z/x/y.pbf` + `/tiles/...` route |
+| Published tiles | S3 tile bucket + CloudFront | `data/tiles/{tenant}/{layer}/versions/{version}/z/x/y.pbf` + `/tiles/...` route |
 | Job & layer metadata | DynamoDB | `FileJobStore` / `FileLayerCatalog` (trait-backed) |
 | Lifecycle events | EventBridge | `LoggingEventEmitter` (same §9 JSON schemas) |
-| Atomic publish / rollback | tile-version prefix + manifest | `manifests/{tenant}/{layer}/manifest.json` |
+| Atomic publish / rollback | tile-version prefix + manifest | `manifests/{tenant}/{layer}/publication.json` + candidate verification (`docs/PUBLISHING.md`) |
 
 ```mermaid
 graph TD
@@ -79,8 +79,11 @@ Reliability behaviors implemented locally:
 data/
   staging/{tenantId}/{jobId}/input/…          # raw upload
   staging/{tenantId}/{jobId}/normalized.geojson
-  tiles/{tenantId}/{layerId}/{tileVersion}/{z}/{x}/{y}.pbf
+  tiles/{tenantId}/{layerId}/versions/{tileVersion}/{z}/{x}/{y}.pbf
+  tiles/{tenantId}/{layerId}/versions/{tileVersion}/_manifest/candidate.json
+  manifests/{tenantId}/{layerId}/publication.json  # authoritative version record
   manifests/{tenantId}/{layerId}/manifest.json
+  manifests/{tenantId}/{layerId}/audit.jsonl      # publish/rollback audit
   jobs/{jobId}.json                            # job records (DynamoDB in prod)
   catalog.json                                 # layer metadata (DynamoDB in prod)
 ```

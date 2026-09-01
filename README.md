@@ -128,7 +128,7 @@ cargo run -p vtile-pipeline --bin vtile -- run \
 
 # Decode a generated tile and print its structure:
 cargo run -p vtile-pipeline --bin vtile -- \
-  inspect-tile ./data/tiles/tenant-acme/us-parcels-nyc/<version>/12/1206/1539.pbf
+  inspect-tile ./data/tiles/tenant-acme/us-parcels-nyc/versions/<version>/12/1206/1539.pbf
 ```
 
 ### HTTP API (local mirror of the production contracts)
@@ -200,6 +200,7 @@ production cutover checklist.
 | §14 NFRs (idempotency, atomic publish/rollback, retries) | `job.rs` idempotency guard, manifest swap, SQS redrive ×3 |
 | DLQ/quarantine/replay workflow | `vtile-pipeline/src/{quarantine,replay}.rs` |
 | Idempotent job processing (identity, dedupe, leases, replay guardrails, telemetry) | `vtile-pipeline/src/{idempotency,store}.rs`, `docs/IDEMPOTENCY.md` |
+| Atomic publishing (candidate staging, checksums, conditional promotion, rollback, audit) | `vtile-pipeline/src/publish.rs`, `docs/PUBLISHING.md` |
 | Local dev loop (make targets, fixtures, smoke) | `Makefile`, `scripts/`, `docs/LOCAL_DEV.md` |
 
 ## Documentation
@@ -207,6 +208,7 @@ production cutover checklist.
 - [`docs/LOCAL_DEV.md`](docs/LOCAL_DEV.md) — local pipeline walkthrough: make targets, data layout, job lifecycle, failure/replay, Docker
 - [`docs/ERRORS.md`](docs/ERRORS.md) — the error taxonomy: codes, HTTP statuses, failed stages, quarantine + replay semantics
 - [`docs/IDEMPOTENCY.md`](docs/IDEMPOTENCY.md) — idempotent job processing: identity keys, duplicate-event suppression, leases, replay guardrails, telemetry
+- [`docs/PUBLISHING.md`](docs/PUBLISHING.md) — atomic publishing: candidate staging, completeness verification, conditional promotion, rollback, audit trail
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — component map, workflow, storage layout, production cutover
 - [`docs/MVT.md`](docs/MVT.md) — the MVT v2 wire format and how the encoder works
 - [`docs/PRECISION.md`](docs/PRECISION.md) — 7-decimal requirement vs. MVT quantization per zoom (read this before trusting tile geometry for measurement)

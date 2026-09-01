@@ -1,10 +1,16 @@
-//! `GET /tiles/:tenant/:layer/:z/:x/:y[.pbf]` (TRD §8.5, US-03).
+//! Tile serving routes (TRD §8.5 + Sequence 2 US-AP-04 consistent read path).
 //!
-//! Serves published tiles from the local tile store, following the on-disk
-//! mirror of the TRD §6 layout:
-//! `tiles/{tenantId}/{layerId}/{tileVersion}/{z}/{x}/{y}.pbf`, where the
-//! live `tileVersion` is read from the layer's manifest (TRD §14 atomic
-//! publish via manifest swap).
+//! Two read patterns:
+//! * `GET /tiles/:tenant/:layer/:z/:x/:y[.pbf]` — stable unversioned URL;
+//!   the server resolves the authoritative current version from the layer
+//!   registry (`publication.json`), falling back to `manifest.json` for
+//!   layers published before the registry existed.
+//! * `GET /tiles/:tenant/:layer/versions/:version/:z/:x/:y[.pbf]` — explicit
+//!   version URL for pinning, validation, and rollback verification.
+//!
+//! Tiles are always served from the immutable version path
+//! `tiles/{tenant}/{layer}/versions/{version}/...` — a candidate version
+//! under generation is never reachable (Sequence 2 US-AP-01).
 //!
 //! Status-code contract (TRD §8.5):
 //! * `200` with gzipped MVT payload, `Content-Type:
@@ -17,7 +23,9 @@
 //!   coordinates.
 //!
 //! Production mapping: CloudFront fronts S3 and a Lambda@Edge
-//! `OriginResponse` handler supplies the 204-for-missing behavior (US-03).
+//! `OriginResponse` handler supplies the 204-for-missing behavior; the
+//! version rewrite maps onto CloudFront Functions resolving the DynamoDB
+//! authoritative record (short TTL, invalidation for urgent rollback).
 
 use std::sync::Arc;
 
@@ -25,7 +33,9 @@ use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 
+use vtile_core::model::LayerMetadata;
 use vtile_pipeline::manifest::TileManifest;
+use vtile_pipeline::publish::{version_root, FileLayerRegistry};
 
 use crate::auth;
 use crate::error::ApiError;
@@ -55,20 +65,20 @@ fn parse_tile_coords(z_raw: &str, x_raw: &str, y_raw: &str) -> Result<TileCoord,
     Ok(TileCoord { z, x, y })
 }
 
-pub async fn get_tile(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path((tenant_id, layer_id, z_raw, x_raw, y_raw)): Path<(
-        String,
-        String,
-        String,
-        String,
-        String,
-    )>,
-) -> Result<Response, ApiError> {
+/// Tenant authorization + layer lookup + coordinate/range validation shared
+/// by both read patterns.
+fn resolve_request(
+    state: &AppState,
+    headers: &HeaderMap,
+    tenant_id: &str,
+    layer_id: &str,
+    z_raw: &str,
+    x_raw: &str,
+    y_raw: &str,
+) -> Result<(LayerMetadata, TileCoord), ApiError> {
     // 1. Tenant authorization (TRD §13): token-authenticated callers are
     //    pinned to their own tenant prefix.
-    if let Some(tenant) = auth::authorized_tenant(&state, &headers) {
+    if let Some(tenant) = auth::authorized_tenant(state, headers) {
         if tenant != tenant_id {
             return Err(ApiError::forbidden(format!(
                 "tenant {tenant} cannot access tiles of tenant {tenant_id}"
@@ -80,7 +90,7 @@ pub async fn get_tile(
     //    tenant check doubles as existence-hiding across tenants.
     let layer = state
         .catalog
-        .get(&layer_id)?
+        .get(layer_id)?
         .filter(|l| l.tenant_id == tenant_id)
         .ok_or_else(|| {
             ApiError::not_found("LAYER_NOT_FOUND", format!("layer {layer_id} not found"))
@@ -88,7 +98,7 @@ pub async fn get_tile(
 
     // 3. Coordinate parsing and range checks (TRD §8.5: 422 for invalid
     //    zoom range).
-    let coord = parse_tile_coords(&z_raw, &x_raw, &y_raw)?;
+    let coord = parse_tile_coords(z_raw, x_raw, y_raw)?;
     if coord.z < layer.min_zoom || coord.z > layer.max_zoom {
         return Err(ApiError::unprocessable(
             "ZOOM_OUT_OF_RANGE",
@@ -116,36 +126,23 @@ pub async fn get_tile(
             ),
         ));
     }
+    Ok((layer, coord))
+}
 
-    // 4. Resolve the live tile version through the manifest (TRD §14
-    //    atomic publish / rollback semantics).
-    let manifest_path = state
-        .data_dir
-        .join("manifests")
-        .join(&tenant_id)
-        .join(&layer_id)
-        .join("manifest.json");
-    let manifest_json = tokio::fs::read_to_string(&manifest_path)
-        .await
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                ApiError::not_found(
-                    "LAYER_NOT_PUBLISHED",
-                    format!("layer {layer_id} has no published tiles"),
-                )
-            } else {
-                ApiError::internal(format!("reading manifest failed: {e}"))
-            }
-        })?;
-    let manifest = TileManifest::from_json(&manifest_json)?;
-
-    // 5. Serve the tile, or 204 for empty/void tiles.
-    let tile_path = state
+/// Serves one tile from the immutable version path, or `204` for voids.
+async fn serve_tile(
+    state: &AppState,
+    tenant_id: &str,
+    layer_id: &str,
+    tile_version: &str,
+    coord: &TileCoord,
+) -> Result<Response, ApiError> {
+    let tiles_root = state
         .data_dir
         .join("tiles")
-        .join(&tenant_id)
-        .join(&layer_id)
-        .join(&manifest.tile_version)
+        .join(tenant_id)
+        .join(layer_id);
+    let tile_path = version_root(&tiles_root, tile_version)
         .join(format!("{}/{}/{}.pbf", coord.z, coord.x, coord.y));
     let bytes = match tokio::fs::read(&tile_path).await {
         Ok(bytes) => bytes,
@@ -158,7 +155,8 @@ pub async fn get_tile(
     };
 
     // Cache policy per US-03: low zooms are static geography (1 day),
-    // detail zooms refresh hourly.
+    // detail zooms refresh hourly. Production tunes these per layer; urgent
+    // rollbacks invalidate the CDN cache (Sequence 2 US-AP-05).
     let cache_control = if coord.z <= 10 {
         HeaderValue::from_static("public, max-age=86400")
     } else {
@@ -166,11 +164,11 @@ pub async fn get_tile(
     };
     let etag = HeaderValue::from_str(&format!(
         "\"{}/{}/{}/{}\"",
-        manifest.tile_version, coord.z, coord.x, coord.y
+        tile_version, coord.z, coord.x, coord.y
     ))
     .map_err(|e| ApiError::internal(format!("invalid etag: {e}")))?;
 
-    let response = (
+    Ok((
         [
             (header::CONTENT_TYPE, HeaderValue::from_static(MVT_CONTENT_TYPE)),
             (header::CONTENT_ENCODING, HeaderValue::from_static("gzip")),
@@ -179,6 +177,74 @@ pub async fn get_tile(
         ],
         bytes,
     )
-        .into_response();
-    Ok(response)
+        .into_response())
+}
+
+pub async fn get_tile(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((tenant_id, layer_id, z_raw, x_raw, y_raw)): Path<(
+        String,
+        String,
+        String,
+        String,
+        String,
+    )>,
+) -> Result<Response, ApiError> {
+    let (_layer, coord) = resolve_request(
+        &state, &headers, &tenant_id, &layer_id, &z_raw, &x_raw, &y_raw,
+    )?;
+
+    // 4. Resolve the live tile version through the authoritative layer
+    //    record (Sequence 2 US-AP-03/04); `manifest.json` remains as the
+    //    pre-registry fallback.
+    let manifests_root = state
+        .data_dir
+        .join("manifests")
+        .join(&tenant_id)
+        .join(&layer_id);
+    let tile_version = match FileLayerRegistry::new(&manifests_root).get()? {
+        Some(record) => record.current_tile_version,
+        None => {
+            let manifest_path = manifests_root.join("manifest.json");
+            let manifest_json =
+                tokio::fs::read_to_string(&manifest_path)
+                    .await
+                    .map_err(|e| {
+                        if e.kind() == std::io::ErrorKind::NotFound {
+                            ApiError::not_found(
+                                "LAYER_NOT_PUBLISHED",
+                                format!("layer {layer_id} has no published tiles"),
+                            )
+                        } else {
+                            ApiError::internal(format!("reading manifest failed: {e}"))
+                        }
+                    })?;
+            TileManifest::from_json(&manifest_json)?.tile_version
+        }
+    };
+
+    // 5. Serve the tile, or 204 for empty/void tiles.
+    serve_tile(&state, &tenant_id, &layer_id, &tile_version, &coord).await
+}
+
+/// Explicit-version read path (Sequence 2 US-AP-04): serves from the named
+/// immutable version regardless of which version is currently promoted —
+/// used for pinning, validation, and rollback verification.
+pub async fn get_tile_versioned(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((tenant_id, layer_id, version, z_raw, x_raw, y_raw)): Path<(
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+    )>,
+) -> Result<Response, ApiError> {
+    let (_layer, coord) = resolve_request(
+        &state, &headers, &tenant_id, &layer_id, &z_raw, &x_raw, &y_raw,
+    )?;
+    serve_tile(&state, &tenant_id, &layer_id, &version, &coord).await
 }

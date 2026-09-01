@@ -64,10 +64,15 @@ data/                                  # local mirror of TRD §6 S3 prefixes
   staging/{tenantId}/{jobId}/
     input/{fileName}                   # raw upload
     normalized.geojson                 # EPSG:4326 normalization artifact
-  tiles/{tenantId}/{layerId}/{tileVersion}/{z}/{x}/{y}.pbf
+  tiles/{tenantId}/{layerId}/versions/{tileVersion}/
+    {z}/{x}/{y}.pbf                    # immutable published tiles
+    _manifest/candidate.json           # candidate integrity manifest (US-AP-02)
+    _SUCCESS                           # completion marker (post-verification)
   manifests/{tenantId}/{layerId}/
-    manifest.json                      # publish pointer (TRD §14 atomic swap)
-    latest.json                        # stable live pointer, identical content
+    publication.json                   # authoritative version record (US-AP-03)
+    manifest.json                      # compatibility publish pointer
+    latest.json                        # atomic live pointer
+    audit.jsonl                        # append-only publish/rollback audit
   quarantine/{tenantId}/{jobId}/
     input.bin                          # original upload bytes
     error-report.json                  # ErrorReport (code, stage, message, ...)
@@ -129,8 +134,12 @@ curl -s localhost:8080/api/v1/jobs/{jobId}
 # 4. Browse the catalog (TRD §8.3/§8.4)
 curl -s 'localhost:8080/api/v1/layers?tenantId=tenant-acme&category=PARCEL&market=nyc'
 
-# 5. Fetch tiles (TRD §8.5: 200 tile / 204 empty / 404 unknown / 422 zoom)
+# 5. Fetch tiles (TRD §8.5: 200 tile / 204 empty / 404 unknown / 422 zoom).
+# The unversioned URL resolves the authoritative current version
+# (publication.json); the versions/ URL pins an explicit version
+# (Sequence 2 US-AP-04).
 curl -s -o tile.pbf localhost:8080/tiles/tenant-acme/us-parcels-fx/14/4824/6157.pbf
+curl -s -o tile.pbf localhost:8080/tiles/tenant-acme/us-parcels-fx/versions/{tileVersion}/14/4824/6157.pbf
 ```
 
 A `category` supplies the TRD §5 default zoom range (PARCEL → 10–16); override
@@ -167,6 +176,30 @@ either publishes a complete new version or leaves the previous one
 untouched. Duplicate uploads and redelivered events are suppressed
 automatically; the counters are visible at `GET /internal/metrics`.
 
+## Rollback walkthrough (Sequence 2 US-AP-05)
+
+Publishing is atomic (candidate → verify → conditional promote), so a bad
+layer is fixed by repointing the authoritative version — no reprocessing
+(see [`PUBLISHING.md`](PUBLISHING.md)):
+
+```bash
+# Inspect the publish history (PUBLISH/ROLLBACK audit chain)
+cat data/manifests/tenant-acme/us-parcels-fx/audit.jsonl
+
+# Roll back to the previous version (reason is mandatory)
+make rollback-layer TENANT=tenant-acme LAYER=us-parcels-fx \
+  TARGET_VERSION=<previous version> REASON="Misaligned parcel refresh"
+
+# Or via the ops API:
+curl -s -X POST localhost:8080/api/v1/ops/layers/us-parcels-fx/rollback \
+  -H 'Content-Type: application/json' \
+  -d '{"targetTileVersion":"<previous version>","reason":"Misaligned parcel refresh"}'
+```
+
+Rollback is idempotent (rolling back to the current version is a no-op),
+emits `vector.tile.version.rolled_back`, and appends a `ROLLBACK` audit
+record with actor + reason.
+
 ## CLI reference (`vtile`)
 
 The same binary is the Fargate entrypoint in production (TRD §11 Decision 2).
@@ -179,6 +212,8 @@ vtile inspect-tile ./data/tiles/.../14/4824/6157.pbf
 vtile job-status --data-dir ./data --job-id job_...
 vtile replay --data-dir ./data --tenant tenant-acme --job-id job_... \
     [--assume-wgs84] [--requested-by NAME] [--reason TEXT] [--create-new-version]
+vtile rollback --data-dir ./data --tenant tenant-acme --layer us-parcels-fx \
+    --target-version <version> --reason "..." [--requested-by NAME]
 ```
 
 `--normalize-only` stops after the normalization artifact (states 1–7) and
@@ -230,6 +265,10 @@ snapshot (Sequence 1 US-06); `make metrics` wraps it.
   version-checked transitions, leases, dedupe, orphan handling, and replay
   guardrails run in-process against the filesystem; DynamoDB provides the
   atomic conditionals in production (`docs/IDEMPOTENCY.md`).
+- **Atomic publishing is real.** Candidate staging, checksum verification,
+  conditional promotion, rollback, and the audit trail run against the
+  filesystem with the same semantics as the S3 + DynamoDB production design
+  (`docs/PUBLISHING.md`).
 - **No real queue.** The PUT handler starts processing in-process; the TRD
   "job start < 30 s" NFR is trivially met locally.
 - **File stores instead of DynamoDB.** Single-file catalog (`catalog.json`) —

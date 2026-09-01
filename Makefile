@@ -16,13 +16,16 @@ ASSUME_WGS84 ?= 0
 REQUESTED_BY ?= make-replay
 REASON       ?=
 CREATE_NEW_VERSION ?= 0
+# Sequence 2 US-AP-05 rollback fields.
+LAYER          ?=
+TARGET_VERSION ?=
 
 RELEASE := target/release
 
 .DEFAULT_GOAL := help
 
 .PHONY: help build fixtures setup setup-docker run-local run-local-docker \
-        seed job-status smoke replay-job metrics test clean distclean
+        seed job-status smoke replay-job rollback-layer metrics test clean distclean
 
 help: ## Show available targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
@@ -74,6 +77,14 @@ replay-job: ## Replay a job: make replay-job JOB_ID=job_... [ASSUME_WGS84=1] [CR
 
 metrics: ## Idempotency telemetry snapshot from the running API
 	curl -s "http://$(HOST):$(PORT)/internal/metrics"
+
+rollback-layer: ## Roll back a layer: make rollback-layer LAYER=l TARGET_VERSION=v REASON="..."
+	@test -n "$(LAYER)" -a -n "$(TARGET_VERSION)" || { echo "usage: make rollback-layer TENANT=$(TENANT) LAYER=<layerId> TARGET_VERSION=<version> REASON=\"...\""; exit 2; }
+	@if [ -x "$(RELEASE)/vtile" ]; then \
+		"$(RELEASE)/vtile" rollback --data-dir $(DATA_DIR) --tenant $(TENANT) --layer $(LAYER) --target-version $(TARGET_VERSION) --reason "$(REASON)" --requested-by "$(REQUESTED_BY)"; \
+	else \
+		cargo run -q -p vtile-pipeline --bin vtile -- rollback --data-dir $(DATA_DIR) --tenant $(TENANT) --layer $(LAYER) --target-version $(TARGET_VERSION) --reason "$(REASON)" --requested-by "$(REQUESTED_BY)"; \
+	fi
 
 test: ## Run the workspace test suite
 	cargo test --workspace

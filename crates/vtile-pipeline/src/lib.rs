@@ -18,6 +18,7 @@ pub mod events;
 pub mod idempotency;
 pub mod job;
 pub mod manifest;
+pub mod publish;
 pub mod quarantine;
 pub mod replay;
 pub mod sink_local;
@@ -33,6 +34,12 @@ pub use idempotency::{
 };
 pub use job::{run_job, JobDeps, RunJobInput};
 pub use manifest::TileManifest;
+pub use publish::{
+    aggregate_checksum, promote_layer_version, read_candidate_manifest, rollback_layer_version,
+    tile_url_template_for, verify_candidate, write_candidate_manifest, AuditAction,
+    CandidateManifest, FileAuditLog, FileLayerRegistry, LayerVersionRecord, PublishAuditRecord,
+    PublishMetric, PublishMetrics, PublishStatus, TileEntry, PIPELINE_ACTOR,
+};
 pub use quarantine::{ErrorReport, FileQuarantineStore, QuarantineStore};
 pub use replay::{replay_job, ReplayOptions};
 pub use store::Lease;

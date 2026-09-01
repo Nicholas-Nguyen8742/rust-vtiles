@@ -58,12 +58,17 @@ Notes:
 
 Tile/store failures are infrastructural; replaying the same bytes without
 fixing the environment adds nothing, so these are **not** quarantined.
+Atomic-publishing codes (`PUBLISH_*`, `PROMOTION_CONFLICT`, `ROLLBACK_FAILED`)
+are detailed in [`PUBLISHING.md`](PUBLISHING.md).
 
 | Code | HTTP | Typical stage | Meaning |
 |---|---:|---|---|
 | `TILE_SIZE_EXCEEDED` | 500 | `TILING` | A tile exceeded the size limit. Reserved: the size-mitigation ladder (drop attributes → coalesce → simplify → split) always converges before this fires today; the variant exists for stricter future policies |
 | `TILE_GENERATION_FAILED` | 500 | `TILING` | MVT preparation/encoding failure (e.g. no tileable features after preparation) |
 | `STORE_ERROR` | 500 | any | Job/layer persistence failure (local: disk; production: DynamoDB) |
+| `PUBLISH_VALIDATION_FAILED` | 500 | `PUBLISHING` | Candidate version failed the completeness gate (tile count, zero-byte, zoom coverage, aggregate checksum). The previous published version stays live; fix the source and re-publish (Sequence 2 US-AP-02) |
+| `PROMOTION_CONFLICT` | 500 | `PUBLISHING` | Conditional promotion lost — the layer's authoritative pointer moved underneath this publisher. Retry with a fresh candidate (Sequence 2 US-AP-03) |
+| `ROLLBACK_FAILED` | 500 | — | Rollback rejected: unknown layer, missing/corrupt target version, or no publication yet. Via the ops API this surfaces as `422 ROLLBACK_INVALID_TARGET` (Sequence 2 US-AP-05) |
 | `PIPELINE_ERROR` | 500 | any | Other orchestration failure (unsupported format reaching the runner, missing bbox, replay preconditions, ...) |
 
 ## Upload-gate and serving responses (API layer)
@@ -75,6 +80,7 @@ These never reach the pipeline; they enforce the TRD §8/§13 contracts.
 | `INVALID_REQUEST` | 400 | `POST /ingest/uploads` | Missing `tenantId` or `layerId` |
 | `UNSUPPORTED_FORMAT` | 422 | `POST /ingest/uploads` | `sourceFormat` outside MVP (GeoJSON/Shapefile only; KML/GeoPackage/FlatGeobuf are post-MVP) |
 | `IDEMPOTENCY_KEY_PAYLOAD_MISMATCH` | 409 | `POST /ingest/uploads` | `Idempotency-Key` reused with a different payload (Sequence 1 US-02) — fix the payload or mint a new key |
+| `ROLLBACK_INVALID_TARGET` | 422 | `POST /ops/layers/{id}/rollback` | Rollback target missing/corrupt, or the layer was never published (Sequence 2 US-AP-05). Missing `targetTileVersion`/`reason` → `400 INVALID_REQUEST` |
 | `UNAUTHORIZED` | 401 | any (auth enabled) | Missing/invalid bearer token |
 | `FORBIDDEN` | 403 | jobs, tiles | Token tenant does not match the resource tenant (TRD §13 isolation) |
 | `JOB_NOT_FOUND` | 404 | `GET /jobs/{id}`, content PUT | Unknown job id; content PUTs for unknown jobs are also recorded under `data/orphans/` (Sequence 1 US-03) |

@@ -39,6 +39,21 @@ pub enum PipelineError {
     #[error("job already active: {0}")]
     JobAlreadyActive(String),
 
+    /// Sequence 2 US-AP-02: the candidate tile version failed completeness
+    /// verification (missing tiles, zero-byte tiles, checksum mismatch).
+    #[error("publish validation failed: {0}")]
+    PublishValidation(String),
+
+    /// Sequence 2 US-AP-03: conditional promotion lost — the layer's current
+    /// version changed underneath the publisher.
+    #[error("promotion conflict: {0}")]
+    PromotionConflict(String),
+
+    /// Sequence 2 US-AP-05: rollback rejected (unknown layer, missing or
+    /// corrupt target version).
+    #[error("rollback failed: {0}")]
+    RollbackFailed(String),
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 

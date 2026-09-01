@@ -196,7 +196,7 @@ fn geojson_parcels_end_to_end() {
     assert_eq!(latest.tile_count, manifest.tile_count);
 
     // ── Tiles on disk: versioned prefix, valid MVT v2 ────────────────────
-    let version_root = input.paths.tiles_root.join(&outcome.tile_version);
+    let version_root = input.paths.version_root(&outcome.tile_version);
     let mut tile_files = Vec::new();
     collect_pbf(&version_root, &mut tile_files);
     assert_eq!(tile_files.len(), 4);
@@ -387,7 +387,7 @@ fn point_assets_end_to_end() {
 
     // Every tile carries MVT point features.
     let mut tile_files = Vec::new();
-    collect_pbf(&paths.tiles_root.join(&outcome.tile_version), &mut tile_files);
+    collect_pbf(&paths.version_root(&outcome.tile_version), &mut tile_files);
     assert_eq!(tile_files.len() as u64, outcome.tile_count);
     for file in &tile_files {
         let decoded = decode_gzipped_tile(&fs::read(file).unwrap()).expect("tile must decode");
@@ -427,7 +427,7 @@ fn fixture_simple_parcels_end_to_end() {
     // Tiles decode and carry CRE identifiers without PII.
     let mut tile_files = Vec::new();
     collect_pbf(
-        &input.paths.tiles_root.join(&outcome.tile_version),
+        &input.paths.version_root(&outcome.tile_version),
         &mut tile_files,
     );
     assert!(!tile_files.is_empty());
@@ -527,7 +527,7 @@ fn shapefile_bundle_end_to_end() {
     // Attributes survived the DBF round-trip into MVT keys.
     let mut tile_files = Vec::new();
     collect_pbf(
-        &input.paths.tiles_root.join(&outcome.tile_version),
+        &input.paths.version_root(&outcome.tile_version),
         &mut tile_files,
     );
     assert!(!tile_files.is_empty());
