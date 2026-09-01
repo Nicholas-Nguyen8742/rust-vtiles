@@ -43,5 +43,7 @@ pub async fn get_job(
         bounding_box: outcome.map(|o| o.bounding_box.to_vec()),
         completed_at: outcome.map(|o| o.completed_at.format("%Y-%m-%dT%H:%M:%SZ").to_string()),
         error: job.error,
+        error_code: job.error_code,
+        failed_stage: job.failed_stage,
     }))
 }

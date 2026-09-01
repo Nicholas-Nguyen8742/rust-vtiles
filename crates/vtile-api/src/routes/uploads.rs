@@ -11,8 +11,10 @@ use chrono::Utc;
 use vtile_core::config::TileConfig;
 use vtile_core::model::{JobRecord, JobStatus, LayerCategory};
 use vtile_ingest::normalize::{CrsPolicy, NormalizeOptions};
+use vtile_ingest::validate::validate_file_type;
 use vtile_pipeline::events::PipelineEvent;
 use vtile_pipeline::job::{new_job_id, run_job, JobPaths, RunJobInput};
+use vtile_pipeline::FileQuarantineStore;
 use vtile_pipeline::JobDeps;
 
 use crate::dto::{UploadAcceptedResponse, UploadRequest, UploadResponse};
@@ -44,11 +46,30 @@ pub async fn create_upload(
             ),
         ));
     }
+    // Recommendation 3 US-01: reject extension/content-type mismatches
+    // before creating any job record (`INVALID_FILE_TYPE`).
+    validate_file_type(&req.file_name, req.content_type.as_deref(), req.source_format)?;
 
     let category = req.metadata.as_ref().and_then(|m| m.category);
     let zoom_range = req
         .requested_zoom_range
         .unwrap_or_else(|| category.unwrap_or(LayerCategory::Other).default_zoom_range());
+
+    // The assume-WGS84 DTO flag is normalized into the `assume-wgs84` tag
+    // convention so it survives to content-PUT time, where `crs_policy_for`
+    // decides the CRS policy.
+    let mut layer_input = req.metadata.map(|m| vtile_core::model::LayerMetadataInput {
+        name: m.name,
+        description: m.description,
+        category: m.category,
+        tags: m.tags,
+    });
+    if req.assume_crs_wgs84 {
+        let input = layer_input.get_or_insert_with(Default::default);
+        if !input.tags.iter().any(|t| t == "assume-wgs84") {
+            input.tags.push("assume-wgs84".to_string());
+        }
+    }
 
     let job_id = new_job_id();
     let now = Utc::now();
@@ -68,15 +89,13 @@ pub async fn create_upload(
         created_at: now,
         updated_at: now,
         error: None,
+        error_code: None,
+        failed_stage: None,
         outcome: None,
-        layer_input: req.metadata.map(|m| vtile_core::model::LayerMetadataInput {
-            name: m.name,
-            description: m.description,
-            category: m.category,
-            tags: m.tags,
-        }),
+        layer_input,
     };
-    state.jobs.create(job)?;
+    state.jobs.create(job.clone())?;
+    tracing::info!(job_id = %job_id, tenant = %req.tenant_id, layer = %req.layer_id, "upload job created");
 
     Ok((
         StatusCode::ACCEPTED,
@@ -148,6 +167,7 @@ pub async fn upload_content(
         max_upload_bytes: state.max_upload_bytes,
         crs_policy: crs_policy_for(&state, &job_id),
         property_policy: tile_config.property_policy.clone(),
+        ..Default::default()
     };
     let paths = JobPaths {
         staging_root: state
@@ -171,6 +191,11 @@ pub async fn upload_content(
         jobs: state.jobs.clone(),
         catalog: state.catalog.clone(),
         events: state.events.clone(),
+        // Recommendation 3 US-03: failed uploads land in
+        // `quarantine/{tenantId}/{jobId}/` for inspection and replay.
+        quarantine: Some(Arc::new(FileQuarantineStore::new(
+            state.data_dir.join("quarantine"),
+        ))),
     };
     let input = RunJobInput {
         job,
@@ -196,9 +221,10 @@ pub async fn upload_content(
     ))
 }
 
-/// MVP: the assume-WGS84 choice is a property of the upload request. Because
-/// the content PUT carries no JSON body, the flag is looked up from the job's
-/// stored layer input tags convention (`assume-wgs84`). Production passes it
+/// MVP: the assume-WGS84 choice is a property of the upload request
+/// (`assumeCrsWgs84`, normalized into the `assume-wgs84` tag by
+/// `create_upload`). Because the content PUT carries no JSON body, the flag
+/// is looked up from the job's stored layer-input tags. Production passes it
 /// through SQS message attributes.
 fn crs_policy_for(state: &AppState, job_id: &str) -> CrsPolicy {
     let Ok(Some(job)) = state.jobs.get(job_id) else {

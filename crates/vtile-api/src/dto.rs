@@ -72,6 +72,12 @@ pub struct JobResponse {
     pub completed_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Machine-readable failure taxonomy code (docs/ERRORS.md).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    /// Workflow stage where a failed job stopped (e.g. `NORMALIZING`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failed_stage: Option<String>,
 }
 
 /// `GET /api/v1/layers` query parameters (TRD §8.3).

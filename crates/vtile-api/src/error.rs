@@ -79,21 +79,13 @@ impl From<vtile_ingest::IngestError> for ApiError {
 
 fn ingest_error_to_api(err: &vtile_ingest::IngestError) -> ApiError {
     use vtile_ingest::IngestError as I;
-    match err {
-        I::InvalidShapefile(msg) => ApiError::unprocessable("INVALID_SHAPEFILE", msg.clone()),
-        I::InvalidGeoJson(msg) => ApiError::unprocessable("INVALID_GEOJSON", msg.clone()),
-        I::EmptyDataset(msg) => ApiError::unprocessable("EMPTY_DATASET", msg.clone()),
-        I::PayloadTooLarge { size, max } => ApiError::new(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "PAYLOAD_TOO_LARGE",
-            format!("{size} bytes exceeds limit of {max}"),
-        ),
-        I::UnsupportedCrs(msg) => ApiError::unprocessable("UNSUPPORTED_CRS", msg.clone()),
-        I::UnknownCrs(msg) => ApiError::unprocessable("UNKNOWN_CRS", msg.clone()),
-        I::GeometryErrors { .. } => ApiError::unprocessable("GEOMETRY_ERRORS", err.to_string()),
-        I::Zip(msg) => ApiError::unprocessable("INVALID_SHAPEFILE", msg.clone()),
-        I::Encoding(msg) => ApiError::unprocessable("ENCODING_ERROR", msg.clone()),
-        I::Io(io) => ApiError::internal(io.to_string()),
-        I::Other(msg) => ApiError::internal(msg.clone()),
-    }
+    // Single source of truth for the code (docs/ERRORS.md); only the HTTP
+    // status is decided here.
+    let code = err.error_code();
+    let status = match err {
+        I::PayloadTooLarge { .. } | I::DatasetTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
+        I::Io(_) | I::Other(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        _ => StatusCode::UNPROCESSABLE_ENTITY,
+    };
+    ApiError::new(status, code, err.to_string())
 }

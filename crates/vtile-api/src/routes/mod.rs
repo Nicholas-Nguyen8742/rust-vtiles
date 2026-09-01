@@ -9,14 +9,8 @@ pub mod uploads;
 use vtile_core::model::LayerCategory;
 
 /// TRD layer naming convention `{source}_{type}` (US-09) for MVT layer names.
+/// Delegates to the pipeline crate so the API, CLI, and replay path share
+/// one implementation.
 pub fn mvt_layer_name(category: Option<LayerCategory>, layer_id: &str) -> String {
-    match category {
-        Some(LayerCategory::Parcel) => "parcel_boundary".to_string(),
-        Some(LayerCategory::Zoning) => "zoning_district".to_string(),
-        Some(LayerCategory::FloodRisk) => "flood_100yr".to_string(),
-        Some(LayerCategory::Submarket) => "submarket_area".to_string(),
-        Some(LayerCategory::AssetPoint) => "asset_point".to_string(),
-        Some(LayerCategory::Macro) => "macro_region".to_string(),
-        Some(LayerCategory::Other) | None => format!("{layer_id}_features"),
-    }
+    vtile_pipeline::job::default_mvt_layer_name(category, layer_id)
 }
