@@ -37,7 +37,9 @@ impl SourceFormat {
     }
 }
 
-/// Job lifecycle states (TRD §7 job record + §10 workflow).
+/// Job lifecycle states (TRD §7 job record + §10 workflow, extended by the
+/// idempotency epic: `VALIDATION_QUEUED` maps to `Queued`, `CANCELLED` is
+/// terminal and not replayable).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum JobStatus {
@@ -49,11 +51,40 @@ pub enum JobStatus {
     Publishing,
     Completed,
     Failed,
+    Cancelled,
 }
 
 impl JobStatus {
     pub fn is_terminal(&self) -> bool {
-        matches!(self, Self::Completed | Self::Failed)
+        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+    }
+
+    /// Jobs in these states are owned by an active processor; duplicate
+    /// events for them are acknowledged without starting new work
+    /// (idempotency epic US-03 "already PROCESSING" bucket).
+    pub fn is_active(&self) -> bool {
+        matches!(
+            self,
+            Self::Queued | Self::Validating | Self::Normalizing | Self::Tiling | Self::Publishing
+        )
+    }
+
+    /// Optimistic state machine (idempotency epic US-04): the only legal
+    /// forward edges. Replay adds `Failed → Queued` and the guarded
+    /// `Completed → Queued` (createNewVersion) edges.
+    pub fn can_transition_to(self, next: JobStatus) -> bool {
+        use JobStatus::*;
+        matches!(
+            (self, next),
+            (UploadPending, Queued)
+                | (Queued, Validating | Failed | Cancelled)
+                | (Validating, Normalizing | Failed | Cancelled)
+                | (Normalizing, Tiling | Failed | Cancelled)
+                | (Tiling, Publishing | Failed | Cancelled)
+                | (Publishing, Completed | Failed | Cancelled)
+                | (Failed, Queued)
+                | (Completed, Queued)
+        )
     }
 
     /// Serialized form (matches the serde `SCREAMING_SNAKE_CASE` rename),
@@ -68,7 +99,14 @@ impl JobStatus {
             Self::Publishing => "PUBLISHING",
             Self::Completed => "COMPLETED",
             Self::Failed => "FAILED",
+            Self::Cancelled => "CANCELLED",
         }
+    }
+
+    /// States in which a worker may acquire the lease and process the job
+    /// (idempotency epic US-04 lease precondition).
+    pub fn is_runnable(&self) -> bool {
+        matches!(self, Self::UploadPending | Self::Queued)
     }
 }
 
@@ -215,12 +253,68 @@ pub struct JobRecord {
     /// where in the TRD §10 state machine the job stopped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failed_stage: Option<String>,
+    /// Sequence 1 US-01: `sha256:` idempotency key of the upload request —
+    /// SHA-256(tenantId + layerId + client token + processing profile).
+    /// Duplicate upload requests with the same key return this job instead of
+    /// creating a new one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+    /// Sequence 1 US-02: fingerprint of the upload request payload, used to
+    /// detect a reused idempotency key with a *different* payload
+    /// (`IDEMPOTENCY_KEY_PAYLOAD_MISMATCH`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_fingerprint: Option<String>,
+    /// Sequence 1 US-03: fingerprint of the event that started processing
+    /// (tenant + layer + object key + etag + jobId), for redelivery dedupe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_dedupe_fingerprint: Option<String>,
+    /// Sequence 1 US-04: optimistic-concurrency version; every state write
+    /// bumps it. Conditional transitions reject stale versions.
+    #[serde(default = "default_state_version")]
+    pub state_version: u64,
+    /// Active worker lease (Sequence 1 US-04); cleared when the run finishes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locked_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_expires_at: Option<DateTime<Utc>>,
+    /// Sequence 1 US-03: duplicate events acknowledged for this job.
+    #[serde(default)]
+    pub duplicate_event_count: u64,
+    /// Sequence 1 US-01: tile version requested at upload time (each run
+    /// still mints its own published `tileVersion`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_tile_version: Option<String>,
+    /// Sequence 1 US-05: audit record of the most recent replay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_audit: Option<ReplayAudit>,
     /// Populated when the job completes (feature count, tile count, bbox...).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<JobOutcomeSummary>,
     /// Layer metadata supplied at upload time (name, category, tags...).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub layer_input: Option<LayerMetadataInput>,
+}
+
+/// Legacy job files predate `stateVersion`; treat absence as version 1.
+fn default_state_version() -> u64 {
+    1
+}
+
+/// Sequence 1 US-05: audit record persisted on the job and emitted as
+/// `vector.tile.job.replay_requested` whenever a replay is performed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplayAudit {
+    /// Operator identity (production: IAM/OIDC principal; local: CLI flag).
+    pub requested_by: String,
+    /// Free-form reason ("Transient Fargate timeout", ...).
+    pub reason: String,
+    /// Replaying a `COMPLETED` job requires this explicit intent to publish a
+    /// new tile version.
+    pub create_new_version: bool,
+    pub occurred_at: DateTime<Utc>,
 }
 
 /// Summary attached to a completed job and returned by `GET /jobs/{jobId}`.
