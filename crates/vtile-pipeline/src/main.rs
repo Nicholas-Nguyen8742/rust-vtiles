@@ -10,7 +10,8 @@
 //!     --min-zoom 10 --max-zoom 16
 //! vtile inspect-tile ./data/tiles/.../12/1206/1538.pbf
 //! vtile job-status --data-dir ./data --job-id job_...
-//! vtile replay --data-dir ./data --tenant tenant-acme --job-id job_... --assume-wgs84
+//! vtile replay --data-dir ./data --tenant tenant-acme --job-id job_... \
+//!     --assume-wgs84 --requested-by sre-user --reason "Transient Fargate timeout"
 //! ```
 
 use std::fs;
@@ -24,9 +25,13 @@ use vtile_core::config::TileConfig;
 use vtile_core::model::{JobRecord, JobStatus, LayerCategory, SourceFormat, ZoomRange};
 use vtile_ingest::normalize::{CrsPolicy, NormalizeOptions};
 use vtile_pipeline::events::LoggingEventEmitter;
-use vtile_pipeline::job::{job_paths_for, new_job_id, run_job, RunJobInput};
+use vtile_pipeline::job::{
+    job_paths_for, new_idempotency_token, new_job_id, new_tile_version, run_job, RunJobInput,
+};
 use vtile_pipeline::store::{FileJobStore, FileLayerCatalog, JobStore};
-use vtile_pipeline::{FileQuarantineStore, JobDeps, ReplayOptions};
+use vtile_pipeline::{
+    processing_profile_label, upload_idempotency_key, FileQuarantineStore, JobDeps, ReplayOptions,
+};
 
 #[derive(Parser)]
 #[command(name = "vtile", about = "Vector tile processor", version)]
@@ -99,6 +104,16 @@ enum Command {
         /// "user confirmation" TRD §10 requires for missing `.prj`.
         #[arg(long, default_value_t = false)]
         assume_wgs84: bool,
+        /// Operator identity recorded in the replay audit (Sequence 1 US-05).
+        #[arg(long, default_value = "cli")]
+        requested_by: String,
+        /// Reason recorded in the replay audit (Sequence 1 US-05).
+        #[arg(long, default_value = "")]
+        reason: String,
+        /// Explicit intent to publish a new tile version from a COMPLETED
+        /// job; required to replay completed jobs (Sequence 1 US-05).
+        #[arg(long, default_value_t = false)]
+        create_new_version: bool,
     },
 }
 
@@ -174,7 +189,18 @@ fn main() -> Result<()> {
             tenant,
             job_id,
             assume_wgs84,
-        } => replay(data_dir, tenant, job_id, assume_wgs84),
+            requested_by,
+            reason,
+            create_new_version,
+        } => replay(
+            data_dir,
+            tenant,
+            job_id,
+            assume_wgs84,
+            requested_by,
+            reason,
+            create_new_version,
+        ),
     }
 }
 
@@ -249,6 +275,23 @@ fn run(
         error: None,
         error_code: None,
         failed_stage: None,
+        // Sequence 1 US-01: CLI runs are intentional one-shot uploads — a
+        // server-minted token gives each run its own idempotency key.
+        idempotency_key: Some(upload_idempotency_key(
+            &tenant,
+            &layer,
+            &new_idempotency_token(),
+            &processing_profile_label(category, zoom_range),
+        )),
+        request_fingerprint: None,
+        event_dedupe_fingerprint: None,
+        state_version: 1,
+        lease_token: None,
+        locked_by: None,
+        lease_expires_at: None,
+        duplicate_event_count: 0,
+        requested_tile_version: Some(new_tile_version()),
+        replay_audit: None,
         outcome: None,
         layer_input: None,
     };
@@ -355,15 +398,30 @@ fn job_status(data_dir: PathBuf, job_id: String) -> Result<()> {
     Ok(())
 }
 
-/// Replays a failed, quarantined job (Recommendation 3 US-03).
-fn replay(data_dir: PathBuf, tenant: String, job_id: String, assume_wgs84: bool) -> Result<()> {
+/// Replays a failed, quarantined job (Recommendation 3 US-03) under the
+/// Sequence 1 US-05 guardrails and audit trail.
+#[allow(clippy::too_many_arguments)]
+fn replay(
+    data_dir: PathBuf,
+    tenant: String,
+    job_id: String,
+    assume_wgs84: bool,
+    requested_by: String,
+    reason: String,
+    create_new_version: bool,
+) -> Result<()> {
     let deps = build_deps(&data_dir)?;
     let outcome = vtile_pipeline::replay_job(
         &deps,
         &data_dir,
         &tenant,
         &job_id,
-        &ReplayOptions { assume_wgs84 },
+        &ReplayOptions {
+            assume_wgs84,
+            requested_by,
+            reason,
+            create_new_version,
+        },
     )?;
     println!(
         "{}",

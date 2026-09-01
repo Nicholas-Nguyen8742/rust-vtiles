@@ -15,6 +15,7 @@
 
 pub mod error;
 pub mod events;
+pub mod idempotency;
 pub mod job;
 pub mod manifest;
 pub mod quarantine;
@@ -25,7 +26,13 @@ pub mod sink_s3;
 pub mod store;
 
 pub use error::{PipelineError, PipelineResult};
+pub use idempotency::{
+    classify_ingest_event, event_dedupe_fingerprint, processing_profile_label, request_fingerprint,
+    upload_idempotency_key, DedupeRecord, DedupeStore, EventDecision, FileDedupeStore,
+    FileOrphanStore, IdempotencyMetrics, Metric, OrphanEvent,
+};
 pub use job::{run_job, JobDeps, RunJobInput};
 pub use manifest::TileManifest;
 pub use quarantine::{ErrorReport, FileQuarantineStore, QuarantineStore};
 pub use replay::{replay_job, ReplayOptions};
+pub use store::Lease;

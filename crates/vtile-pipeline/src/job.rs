@@ -97,13 +97,22 @@ pub struct JobOutcome {
 
 /// Runs the full workflow: validate → normalize → tile → publish → catalog →
 /// event. Job status transitions are persisted through the [`JobStore`].
+///
+/// Sequence 1 US-04: the run acquires the worker lease first (exactly one
+/// active processor per job), checkpoints every stage transition with a
+/// conditional update, and releases the lease when the run settles. A lease
+/// conflict fails fast without touching job state or emitting a failure
+/// event — the winning worker owns the job.
 #[instrument(skip_all, fields(job_id = %input.job.job_id, layer = %input.job.layer_id))]
 pub fn run_job(input: &RunJobInput, deps: &JobDeps) -> PipelineResult<JobOutcome> {
     let job = &input.job;
 
     // TRD §14 reliability: idempotent job processing using jobId.
     if let Some(existing) = deps.jobs.get(&job.job_id)? {
-        if existing.status == JobStatus::Completed {
+        if matches!(
+            existing.status,
+            JobStatus::Completed | JobStatus::Cancelled
+        ) {
             return Err(PipelineError::Job(format!(
                 "job {} already completed (idempotency guard)",
                 job.job_id
@@ -111,22 +120,38 @@ pub fn run_job(input: &RunJobInput, deps: &JobDeps) -> PipelineResult<JobOutcome
         }
     }
 
+    // Sequence 1 US-04: worker lease.
+    let worker_id = format!("vtile-worker-{}", std::process::id());
+    let lease = deps
+        .jobs
+        .acquire_lease(&job.job_id, &worker_id, WORKER_LEASE_SECS)?;
+    info!(
+        job_id = %job.job_id,
+        worker = %worker_id,
+        lease = %lease.lease_token,
+        "worker lease acquired"
+    );
+
     // Tracks the workflow stage so failures can report `failedStage`.
     let mut stage = JobStatus::Queued;
-    match run_job_inner(input, deps, &mut stage) {
+    match run_job_inner(input, deps, &mut stage, &lease.lease_token) {
         Ok(outcome) => Ok(outcome),
         Err(err) => {
             let (code, message) = error_classification(&err);
             let failed_stage = stage.as_str().to_string();
 
             // Persist the failure with taxonomy code + failed stage
-            // (Recommendation 3 US-02).
+            // (Recommendation 3 US-02), releasing the lease (US-04).
             let persisted = match deps.jobs.get(&job.job_id) {
                 Ok(Some(mut record)) => {
                     record.status = JobStatus::Failed;
                     record.error = Some(message.clone());
                     record.error_code = Some(code.clone());
                     record.failed_stage = Some(failed_stage.clone());
+                    record.state_version += 1;
+                    record.lease_token = None;
+                    record.locked_by = None;
+                    record.lease_expires_at = None;
                     record.updated_at = Utc::now();
                     deps.jobs.upsert(record).is_ok()
                 }
@@ -176,14 +201,14 @@ fn run_job_inner(
     input: &RunJobInput,
     deps: &JobDeps,
     stage: &mut JobStatus,
+    lease_token: &str,
 ) -> PipelineResult<JobOutcome> {
     let job = &input.job;
     let paths = &input.paths;
     let mut warnings: Vec<String> = Vec::new();
 
     // ── 1. Validate upload ────────────────────────────────────────────────
-    *stage = JobStatus::Validating;
-    deps.jobs.update_status(&job.job_id, JobStatus::Validating, None)?;
+    advance_stage(deps, &job.job_id, lease_token, stage, JobStatus::Validating)?;
     if !job.source_format.is_supported_in_mvp() {
         return Err(PipelineError::Job(format!(
             "source format {:?} not supported in MVP",
@@ -192,8 +217,7 @@ fn run_job_inner(
     }
 
     // ── 2–7. Detect format → unpack → CRS/geometry validation → normalize ─
-    *stage = JobStatus::Normalizing;
-    deps.jobs.update_status(&job.job_id, JobStatus::Normalizing, None)?;
+    advance_stage(deps, &job.job_id, lease_token, stage, JobStatus::Normalizing)?;
     let source = match job.source_format {
         vtile_core::model::SourceFormat::GeoJson => SourceFile::GeoJson {
             bytes: input.source_bytes.clone(),
@@ -222,8 +246,7 @@ fn run_job_inner(
     };
 
     // ── 8. Generate vector tiles ──────────────────────────────────────────
-    *stage = JobStatus::Tiling;
-    deps.jobs.update_status(&job.job_id, JobStatus::Tiling, None)?;
+    advance_stage(deps, &job.job_id, lease_token, stage, JobStatus::Tiling)?;
     let tile_version = new_tile_version();
     let raw_features: Vec<RawFeature> = dataset
         .features
@@ -259,8 +282,7 @@ fn run_job_inner(
     );
 
     // ── 9/10. Publish tiles + write manifest ──────────────────────────────
-    *stage = JobStatus::Publishing;
-    deps.jobs.update_status(&job.job_id, JobStatus::Publishing, None)?;
+    advance_stage(deps, &job.job_id, lease_token, stage, JobStatus::Publishing)?;
     let manifest = TileManifest {
         schema_version: crate::manifest::MANIFEST_SCHEMA_VERSION,
         tenant_id: job.tenant_id.clone(),
@@ -323,9 +345,18 @@ fn run_job_inner(
         occurred_at: Utc::now(),
     });
 
-    let mut completed = job.clone();
+    // Finalize on top of the latest stored record so the version history
+    // is intact and the lease is released (Sequence 1 US-04).
+    let mut completed = deps
+        .jobs
+        .get(&job.job_id)?
+        .unwrap_or_else(|| job.clone());
     completed.status = JobStatus::Completed;
     completed.updated_at = Utc::now();
+    completed.state_version += 1;
+    completed.lease_token = None;
+    completed.locked_by = None;
+    completed.lease_expires_at = None;
     completed.outcome = Some(JobOutcomeSummary {
         feature_count: prepared.feature_count(),
         published_tile_count: stats.tiles_written,
@@ -344,6 +375,22 @@ fn run_job_inner(
         stats,
         warnings,
     })
+}
+
+/// Conditional stage checkpoint (Sequence 1 US-04): validates the edge
+/// against the state machine, asserts lease ownership, and bumps
+/// `stateVersion` — the local analog of a DynamoDB conditional update.
+fn advance_stage(
+    deps: &JobDeps,
+    job_id: &str,
+    lease_token: &str,
+    stage: &mut JobStatus,
+    next: JobStatus,
+) -> PipelineResult<()> {
+    deps.jobs
+        .transition(job_id, Some(lease_token), *stage, next)?;
+    *stage = next;
+    Ok(())
 }
 
 /// Maps errors onto the TRD error-code vocabulary used in `job.failed`
@@ -387,6 +434,18 @@ pub fn default_mvt_layer_name(category: Option<LayerCategory>, layer_id: &str) -
 /// Tile version stamp in the TRD example format (`2026-06-17T14-30-00Z`).
 pub fn new_tile_version() -> String {
     Utc::now().format("%Y-%m-%dT%H-%M-%SZ").to_string()
+}
+
+/// Worker lease TTL (Sequence 1 US-04): matches the TRD Fargate hard limit
+/// of 15 minutes; expired leases may be taken over by another worker.
+pub const WORKER_LEASE_SECS: u64 = 900;
+
+/// Server-minted client token for upload requests without an explicit
+/// `Idempotency-Key` — makes every such request unique, so intentional
+/// repeat uploads (e.g. a county parcel refresh) receive a fresh job unless
+/// the client supplies the same token (Sequence 1 US-01 CRE rule).
+pub fn new_idempotency_token() -> String {
+    format!("auto_{}", uuid::Uuid::new_v4().as_simple())
 }
 
 pub fn new_event_id() -> String {
