@@ -12,13 +12,17 @@ PORT         ?= 8080
 TENANT       ?= tenant-acme
 JOB_ID       ?=
 ASSUME_WGS84 ?= 0
+# Sequence 1 US-05 replay audit fields.
+REQUESTED_BY ?= make-replay
+REASON       ?=
+CREATE_NEW_VERSION ?= 0
 
 RELEASE := target/release
 
 .DEFAULT_GOAL := help
 
 .PHONY: help build fixtures setup setup-docker run-local run-local-docker \
-        seed job-status smoke replay-job test clean distclean
+        seed job-status smoke replay-job metrics test clean distclean
 
 help: ## Show available targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
@@ -60,13 +64,16 @@ job-status: ## Job status in GET /jobs/{id} shape: make job-status JOB_ID=job_..
 smoke: ## End-to-end smoke test against a running local API
 	sh scripts/smoke.sh
 
-replay-job: ## Replay a failed job: make replay-job JOB_ID=job_... [ASSUME_WGS84=1]
-	@test -n "$(JOB_ID)" || { echo "usage: make replay-job TENANT=$(TENANT) JOB_ID=job_... [ASSUME_WGS84=1]"; exit 2; }
+replay-job: ## Replay a job: make replay-job JOB_ID=job_... [ASSUME_WGS84=1] [CREATE_NEW_VERSION=1]
+	@test -n "$(JOB_ID)" || { echo "usage: make replay-job TENANT=$(TENANT) JOB_ID=job_... [ASSUME_WGS84=1] [CREATE_NEW_VERSION=1] [REASON=\"...\"]"; exit 2; }
 	@if [ -x "$(RELEASE)/vtile" ]; then \
-		"$(RELEASE)/vtile" replay --data-dir $(DATA_DIR) --tenant $(TENANT) --job-id $(JOB_ID) $(if $(filter 1,$(ASSUME_WGS84)),--assume-wgs84,); \
+		"$(RELEASE)/vtile" replay --data-dir $(DATA_DIR) --tenant $(TENANT) --job-id $(JOB_ID) --requested-by $(REQUESTED_BY) --reason "$(REASON)" $(if $(filter 1,$(ASSUME_WGS84)),--assume-wgs84,) $(if $(filter 1,$(CREATE_NEW_VERSION)),--create-new-version,); \
 	else \
-		cargo run -q -p vtile-pipeline --bin vtile -- replay --data-dir $(DATA_DIR) --tenant $(TENANT) --job-id $(JOB_ID) $(if $(filter 1,$(ASSUME_WGS84)),--assume-wgs84,); \
+		cargo run -q -p vtile-pipeline --bin vtile -- replay --data-dir $(DATA_DIR) --tenant $(TENANT) --job-id $(JOB_ID) --requested-by $(REQUESTED_BY) --reason "$(REASON)" $(if $(filter 1,$(ASSUME_WGS84)),--assume-wgs84,) $(if $(filter 1,$(CREATE_NEW_VERSION)),--create-new-version,); \
 	fi
+
+metrics: ## Idempotency telemetry snapshot from the running API
+	curl -s "http://$(HOST):$(PORT)/internal/metrics"
 
 test: ## Run the workspace test suite
 	cargo test --workspace
