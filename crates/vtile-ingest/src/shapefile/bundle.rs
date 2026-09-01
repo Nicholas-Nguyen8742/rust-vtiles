@@ -23,8 +23,9 @@ pub struct ShapefileBundle {
 
 /// Extracts and validates a zipped shapefile bundle.
 ///
-/// Validation per TRD §10: `.shp` and `.dbf` are mandatory; missing `.dbf`
-/// yields `INVALID_SHAPEFILE` (see TRD §9 `job.failed` example). A missing
+/// Validation per TRD §10: `.shp` and `.dbf` are mandatory; a missing
+/// component yields `MISSING_SHAPEFILE_COMPONENTS` (the TRD §9 `job.failed`
+/// example message "Missing required .dbf file." is preserved). A missing
 /// `.prj` is allowed here — the CRS policy decides downstream whether to
 /// reject or assume WGS84.
 ///
@@ -85,17 +86,25 @@ pub fn extract_bundle(zip_bytes: &[u8]) -> IngestResult<ShapefileBundle> {
         }
     }
 
-    // TRD §10 validation table.
-    match (&shp, &dbf) {
-        (Some(_), Some(_)) => {}
-        (None, _) => {
-            return Err(IngestError::InvalidShapefile(
-                "Missing required .shp file.".into(),
-            ))
+    // TRD §10 validation table: report every missing mandatory member.
+    let mut missing: Vec<&str> = Vec::new();
+    if shp.is_none() {
+        missing.push(".shp");
+    }
+    if dbf.is_none() {
+        missing.push(".dbf");
+    }
+    match missing.len() {
+        0 => {}
+        1 => {
+            return Err(IngestError::MissingShapefileComponents(format!(
+                "Missing required {} file.",
+                missing[0]
+            )))
         }
-        (_, None) => {
-            return Err(IngestError::InvalidShapefile(
-                "Missing required .dbf file.".into(),
+        _ => {
+            return Err(IngestError::MissingShapefileComponents(
+                "Missing required .shp and .dbf files.".into(),
             ))
         }
     }
@@ -159,7 +168,10 @@ mod tests {
     fn rejects_bundle_missing_dbf() {
         let data = zip_with(&[("a.shp", b"x"), ("a.shx", b"y")]);
         let err = extract_bundle(&data).unwrap_err();
-        assert!(matches!(err, IngestError::InvalidShapefile(msg) if msg.contains(".dbf")));
+        assert!(
+            matches!(err, IngestError::MissingShapefileComponents(msg) if msg.contains(".dbf"))
+        );
+        assert_eq!(err.error_code(), "MISSING_SHAPEFILE_COMPONENTS");
     }
 
     #[test]

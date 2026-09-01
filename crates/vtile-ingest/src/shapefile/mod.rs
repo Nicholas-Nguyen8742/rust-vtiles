@@ -3,5 +3,6 @@
 pub mod bundle;
 pub mod dbf;
 pub mod shp;
+pub mod write;
 
 pub use bundle::{extract_bundle, read_bundle, ShapefileBundle};
