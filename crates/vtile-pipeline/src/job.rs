@@ -12,7 +12,8 @@ use tracing::{info, instrument};
 
 use vtile_core::config::TileConfig;
 use vtile_core::model::{
-    Bbox, JobOutcomeSummary, JobRecord, JobStatus, LayerMetadata, SecurityClassification,
+    Bbox, JobOutcomeSummary, JobRecord, JobStatus, LayerCategory, LayerMetadata,
+    SecurityClassification,
 };
 use vtile_core::sink::TileObjectMeta;
 use vtile_core::tileset::{generate_tiles, prepare_features, RawFeature, TileStats};
@@ -23,6 +24,7 @@ use vtile_ingest::normalize::{
 use crate::error::{PipelineError, PipelineResult};
 use crate::events::{EventEmitter, PipelineEvent};
 use crate::manifest::TileManifest;
+use crate::quarantine::{ErrorReport, QuarantineStore};
 use crate::sink_local::LocalTileSink;
 use crate::store::{JobStore, LayerCatalog};
 
@@ -45,6 +47,21 @@ impl JobPaths {
     pub fn manifest_path(&self) -> PathBuf {
         self.manifests_root.join("manifest.json")
     }
+
+    /// Stable live pointer written atomically after each publish
+    /// (Recommendation 2 US-04); identical content to `manifest.json`.
+    pub fn latest_path(&self) -> PathBuf {
+        self.manifests_root.join("latest.json")
+    }
+}
+
+/// Standard local layout for one job (mirrors the TRD §6 S3 prefixes).
+pub fn job_paths_for(data_dir: &Path, tenant_id: &str, job_id: &str, layer_id: &str) -> JobPaths {
+    JobPaths {
+        staging_root: data_dir.join("staging").join(tenant_id).join(job_id),
+        tiles_root: data_dir.join("tiles").join(tenant_id).join(layer_id),
+        manifests_root: data_dir.join("manifests").join(tenant_id).join(layer_id),
+    }
 }
 
 /// Shared services for a run.
@@ -52,6 +69,9 @@ pub struct JobDeps {
     pub jobs: Arc<dyn JobStore>,
     pub catalog: Arc<dyn LayerCatalog>,
     pub events: Arc<dyn EventEmitter>,
+    /// Optional quarantine for failed uploads (Recommendation 3 US-03).
+    /// `None` disables quarantine (e.g. unit tests).
+    pub quarantine: Option<Arc<dyn QuarantineStore>>,
 }
 
 /// Everything needed to run one job.
@@ -91,11 +111,54 @@ pub fn run_job(input: &RunJobInput, deps: &JobDeps) -> PipelineResult<JobOutcome
         }
     }
 
-    match run_job_inner(input, deps) {
+    // Tracks the workflow stage so failures can report `failedStage`.
+    let mut stage = JobStatus::Queued;
+    match run_job_inner(input, deps, &mut stage) {
         Ok(outcome) => Ok(outcome),
         Err(err) => {
             let (code, message) = error_classification(&err);
-            let _ = deps.jobs.update_status(&job.job_id, JobStatus::Failed, Some(message.clone()));
+            let failed_stage = stage.as_str().to_string();
+
+            // Persist the failure with taxonomy code + failed stage
+            // (Recommendation 3 US-02).
+            let persisted = match deps.jobs.get(&job.job_id) {
+                Ok(Some(mut record)) => {
+                    record.status = JobStatus::Failed;
+                    record.error = Some(message.clone());
+                    record.error_code = Some(code.clone());
+                    record.failed_stage = Some(failed_stage.clone());
+                    record.updated_at = Utc::now();
+                    deps.jobs.upsert(record).is_ok()
+                }
+                _ => false,
+            };
+            if !persisted {
+                let _ = deps
+                    .jobs
+                    .update_status(&job.job_id, JobStatus::Failed, Some(message.clone()));
+            }
+
+            // Quarantine failed uploads (Recommendation 3 US-03) so SREs can
+            // inspect and replay. Only ingest failures carry a source-data
+            // problem; tile/store failures are infrastructural.
+            if matches!(err, PipelineError::Ingest(_)) {
+                if let Some(quarantine) = deps.quarantine.as_ref() {
+                    let report = ErrorReport::from_job(job, &code, &message, &failed_stage);
+                    match quarantine.quarantine(job, &input.source_bytes, &report) {
+                        Ok(dir) => info!(
+                            job_id = %job.job_id,
+                            quarantine = %dir.display(),
+                            "source quarantined for replay"
+                        ),
+                        Err(qe) => tracing::error!(
+                            job_id = %job.job_id,
+                            error = %qe,
+                            "failed to quarantine source"
+                        ),
+                    }
+                }
+            }
+
             deps.events.emit(PipelineEvent::VectorTileJobFailed {
                 event_id: new_event_id(),
                 tenant_id: job.tenant_id.clone(),
@@ -109,12 +172,17 @@ pub fn run_job(input: &RunJobInput, deps: &JobDeps) -> PipelineResult<JobOutcome
     }
 }
 
-fn run_job_inner(input: &RunJobInput, deps: &JobDeps) -> PipelineResult<JobOutcome> {
+fn run_job_inner(
+    input: &RunJobInput,
+    deps: &JobDeps,
+    stage: &mut JobStatus,
+) -> PipelineResult<JobOutcome> {
     let job = &input.job;
     let paths = &input.paths;
     let mut warnings: Vec<String> = Vec::new();
 
     // ── 1. Validate upload ────────────────────────────────────────────────
+    *stage = JobStatus::Validating;
     deps.jobs.update_status(&job.job_id, JobStatus::Validating, None)?;
     if !job.source_format.is_supported_in_mvp() {
         return Err(PipelineError::Job(format!(
@@ -124,6 +192,7 @@ fn run_job_inner(input: &RunJobInput, deps: &JobDeps) -> PipelineResult<JobOutco
     }
 
     // ── 2–7. Detect format → unpack → CRS/geometry validation → normalize ─
+    *stage = JobStatus::Normalizing;
     deps.jobs.update_status(&job.job_id, JobStatus::Normalizing, None)?;
     let source = match job.source_format {
         vtile_core::model::SourceFormat::GeoJson => SourceFile::GeoJson {
@@ -153,6 +222,7 @@ fn run_job_inner(input: &RunJobInput, deps: &JobDeps) -> PipelineResult<JobOutco
     };
 
     // ── 8. Generate vector tiles ──────────────────────────────────────────
+    *stage = JobStatus::Tiling;
     deps.jobs.update_status(&job.job_id, JobStatus::Tiling, None)?;
     let tile_version = new_tile_version();
     let raw_features: Vec<RawFeature> = dataset
@@ -189,6 +259,7 @@ fn run_job_inner(input: &RunJobInput, deps: &JobDeps) -> PipelineResult<JobOutco
     );
 
     // ── 9/10. Publish tiles + write manifest ──────────────────────────────
+    *stage = JobStatus::Publishing;
     deps.jobs.update_status(&job.job_id, JobStatus::Publishing, None)?;
     let manifest = TileManifest {
         schema_version: crate::manifest::MANIFEST_SCHEMA_VERSION,
@@ -205,6 +276,10 @@ fn run_job_inner(input: &RunJobInput, deps: &JobDeps) -> PipelineResult<JobOutco
     };
     fs::create_dir_all(&paths.manifests_root)?;
     fs::write(paths.manifest_path(), manifest.to_json()?)?;
+    // Atomic live pointer (Recommendation 2 US-04): `latest.json` mirrors the
+    // manifest and is written via tmp + rename so readers never observe a
+    // partial document.
+    write_latest_pointer(paths, &manifest)?;
 
     // ── 11. Update catalog ────────────────────────────────────────────────
     let layer_input = job.layer_input.clone().unwrap_or_default();
@@ -272,25 +347,41 @@ fn run_job_inner(input: &RunJobInput, deps: &JobDeps) -> PipelineResult<JobOutco
 }
 
 /// Maps errors onto the TRD error-code vocabulary used in `job.failed`
-/// events and API responses.
+/// events, job records, and API responses (full table in `docs/ERRORS.md`).
 pub fn error_classification(err: &PipelineError) -> (String, String) {
     let code = match err {
-        PipelineError::Ingest(e) => match e {
-            vtile_ingest::IngestError::InvalidShapefile(_) => "INVALID_SHAPEFILE",
-            vtile_ingest::IngestError::InvalidGeoJson(_) => "INVALID_GEOJSON",
-            vtile_ingest::IngestError::EmptyDataset(_) => "EMPTY_DATASET",
-            vtile_ingest::IngestError::PayloadTooLarge { .. } => "PAYLOAD_TOO_LARGE",
-            vtile_ingest::IngestError::UnsupportedCrs(_) => "UNSUPPORTED_CRS",
-            vtile_ingest::IngestError::UnknownCrs(_) => "UNKNOWN_CRS",
-            vtile_ingest::IngestError::GeometryErrors { .. } => "GEOMETRY_ERRORS",
-            vtile_ingest::IngestError::Zip(_) => "INVALID_SHAPEFILE",
-            _ => "INGEST_FAILED",
+        PipelineError::Ingest(e) => e.error_code(),
+        PipelineError::Tile(e) => match e {
+            vtile_core::TileError::SizeExceeded { .. } => "TILE_SIZE_EXCEEDED",
+            _ => "TILE_GENERATION_FAILED",
         },
-        PipelineError::Tile(_) => "TILE_GENERATION_FAILED",
         PipelineError::Store(_) => "STORE_ERROR",
         _ => "PIPELINE_ERROR",
     };
     (code.to_string(), err.to_string())
+}
+
+/// Writes `latest.json` alongside `manifest.json` (tmp + rename).
+pub fn write_latest_pointer(paths: &JobPaths, manifest: &TileManifest) -> PipelineResult<()> {
+    let tmp = paths.latest_path().with_extension("json.tmp");
+    fs::write(&tmp, manifest.to_json()?)?;
+    fs::rename(&tmp, paths.latest_path())?;
+    Ok(())
+}
+
+/// TRD layer-naming convention `{source}_{type}` (US-09) for MVT layer
+/// names. Single source of truth shared by the CLI, the replay path, and the
+/// API (`vtile_api::routes::mvt_layer_name` delegates here).
+pub fn default_mvt_layer_name(category: Option<LayerCategory>, layer_id: &str) -> String {
+    match category {
+        Some(LayerCategory::Parcel) => "parcel_boundary".to_string(),
+        Some(LayerCategory::Zoning) => "zoning_district".to_string(),
+        Some(LayerCategory::FloodRisk) => "flood_100yr".to_string(),
+        Some(LayerCategory::Submarket) => "submarket_area".to_string(),
+        Some(LayerCategory::AssetPoint) => "asset_point".to_string(),
+        Some(LayerCategory::Macro) => "macro_region".to_string(),
+        Some(LayerCategory::Other) | None => format!("{layer_id}_features"),
+    }
 }
 
 /// Tile version stamp in the TRD example format (`2026-06-17T14-30-00Z`).

@@ -9,6 +9,8 @@
 //!     --format shapefile --input parcels.zip --data-dir ./data \
 //!     --min-zoom 10 --max-zoom 16
 //! vtile inspect-tile ./data/tiles/.../12/1206/1538.pbf
+//! vtile job-status --data-dir ./data --job-id job_...
+//! vtile replay --data-dir ./data --tenant tenant-acme --job-id job_... --assume-wgs84
 //! ```
 
 use std::fs;
@@ -22,9 +24,9 @@ use vtile_core::config::TileConfig;
 use vtile_core::model::{JobRecord, JobStatus, LayerCategory, SourceFormat, ZoomRange};
 use vtile_ingest::normalize::{CrsPolicy, NormalizeOptions};
 use vtile_pipeline::events::LoggingEventEmitter;
-use vtile_pipeline::job::{new_job_id, run_job, JobPaths, RunJobInput};
-use vtile_pipeline::store::{FileJobStore, FileLayerCatalog};
-use vtile_pipeline::JobDeps;
+use vtile_pipeline::job::{job_paths_for, new_job_id, run_job, RunJobInput};
+use vtile_pipeline::store::{FileJobStore, FileLayerCatalog, JobStore};
+use vtile_pipeline::{FileQuarantineStore, JobDeps, ReplayOptions};
 
 #[derive(Parser)]
 #[command(name = "vtile", about = "Vector tile processor", version)]
@@ -75,6 +77,28 @@ enum Command {
     InspectTile {
         /// Path to a tile (.pbf, gzip-compressed or raw).
         path: PathBuf,
+    },
+    /// Print the status of a job in the production `GET /jobs/{jobId}`
+    /// response shape (Recommendation 1 US-03).
+    JobStatus {
+        /// Local data root (must match the run that created the job).
+        #[arg(long, default_value = "./data")]
+        data_dir: PathBuf,
+        #[arg(long)]
+        job_id: String,
+    },
+    /// Replay a failed, quarantined job (Recommendation 3 US-03: DLQ replay).
+    Replay {
+        #[arg(long, default_value = "./data")]
+        data_dir: PathBuf,
+        #[arg(long)]
+        tenant: String,
+        #[arg(long)]
+        job_id: String,
+        /// Assume EPSG:4326 when the source has no CRS information — the
+        /// "user confirmation" TRD §10 requires for missing `.prj`.
+        #[arg(long, default_value_t = false)]
+        assume_wgs84: bool,
     },
 }
 
@@ -144,7 +168,28 @@ fn main() -> Result<()> {
             normalize_only,
         ),
         Command::InspectTile { path } => inspect_tile(path),
+        Command::JobStatus { data_dir, job_id } => job_status(data_dir, job_id),
+        Command::Replay {
+            data_dir,
+            tenant,
+            job_id,
+            assume_wgs84,
+        } => replay(data_dir, tenant, job_id, assume_wgs84),
     }
+}
+
+/// Local service wiring shared by `run` and `replay`.
+fn build_deps(data_dir: &PathBuf) -> Result<JobDeps> {
+    Ok(JobDeps {
+        jobs: Arc::new(FileJobStore::new(data_dir.join("jobs"))?),
+        // Same catalog path as vtile-api so layers published by the CLI are
+        // visible to the API and vice versa (local contract parity).
+        catalog: Arc::new(FileLayerCatalog::new(data_dir.join("catalog.json"))?),
+        events: Arc::new(LoggingEventEmitter),
+        quarantine: Some(Arc::new(FileQuarantineStore::new(
+            data_dir.join("quarantine"),
+        ))),
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -181,8 +226,6 @@ fn run(
         .join("staging")
         .join(&tenant)
         .join(&job_id);
-    let tiles_root = data_dir.join("tiles").join(&tenant).join(&layer);
-    let manifests_root = data_dir.join("manifests").join(&tenant).join(&layer);
 
     // Persist the raw upload alongside the job (staging/input, TRD §6).
     fs::create_dir_all(staging_root.join("input"))?;
@@ -204,6 +247,8 @@ fn run(
         created_at: now,
         updated_at: now,
         error: None,
+        error_code: None,
+        failed_stage: None,
         outcome: None,
         layer_input: None,
     };
@@ -226,11 +271,7 @@ fn run(
         ..Default::default()
     };
 
-    let deps = JobDeps {
-        jobs: Arc::new(FileJobStore::new(data_dir.join("jobs"))?),
-        catalog: Arc::new(FileLayerCatalog::new(data_dir.join("catalog").join("layers.json"))?),
-        events: Arc::new(LoggingEventEmitter),
-    };
+    let deps = build_deps(&data_dir)?;
     deps.jobs.create(job.clone())?;
 
     if normalize_only {
@@ -269,11 +310,7 @@ fn run(
         source_bytes,
         tile_config,
         normalize_opts,
-        paths: JobPaths {
-            staging_root,
-            tiles_root,
-            manifests_root,
-        },
+        paths: job_paths_for(&data_dir, &tenant, &job_id, &layer),
     };
     let outcome = run_job(&input, &deps)?;
 
@@ -288,6 +325,56 @@ fn run(
             "bbox": outcome.bbox.to_vec(),
             "warnings": outcome.warnings,
             "tilesRoot": input.paths.tiles_root.join(&outcome.tile_version),
+        })
+    );
+    Ok(())
+}
+
+/// Prints job status in the production `GET /api/v1/jobs/{jobId}` response
+/// shape (TRD §8.2), including the failure taxonomy added by Recommendation 3
+/// (`errorCode`, `failedStage`).
+fn job_status(data_dir: PathBuf, job_id: String) -> Result<()> {
+    let jobs = FileJobStore::new(data_dir.join("jobs"))?;
+    let job = jobs
+        .get(&job_id)?
+        .ok_or_else(|| anyhow::anyhow!("job {job_id} not found"))?;
+    let outcome = job.outcome.as_ref();
+    let response = serde_json::json!({
+        "jobId": job.job_id,
+        "status": job.status,
+        "layerId": job.layer_id,
+        "featureCount": outcome.map(|o| o.feature_count),
+        "publishedTileCount": outcome.map(|o| o.published_tile_count),
+        "boundingBox": outcome.map(|o| o.bounding_box.to_vec()),
+        "completedAt": outcome.map(|o| o.completed_at.format("%Y-%m-%dT%H:%M:%SZ").to_string()),
+        "error": job.error,
+        "errorCode": job.error_code,
+        "failedStage": job.failed_stage,
+    });
+    println!("{}", serde_json::to_string_pretty(&response)?);
+    Ok(())
+}
+
+/// Replays a failed, quarantined job (Recommendation 3 US-03).
+fn replay(data_dir: PathBuf, tenant: String, job_id: String, assume_wgs84: bool) -> Result<()> {
+    let deps = build_deps(&data_dir)?;
+    let outcome = vtile_pipeline::replay_job(
+        &deps,
+        &data_dir,
+        &tenant,
+        &job_id,
+        &ReplayOptions { assume_wgs84 },
+    )?;
+    println!(
+        "{}",
+        serde_json::json!({
+            "jobId": job_id,
+            "status": "COMPLETED",
+            "featureCount": outcome.feature_count,
+            "tileCount": outcome.tile_count,
+            "tileVersion": outcome.tile_version,
+            "bbox": outcome.bbox.to_vec(),
+            "warnings": outcome.warnings,
         })
     );
     Ok(())
