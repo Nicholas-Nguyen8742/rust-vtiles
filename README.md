@@ -1,5 +1,9 @@
 # Vector Tile Pipeline — Generating Mapbox Vector Tiles in Rust
 
+[![CI](https://github.com/Nicholas-Nguyen8742/rust-vtiles/actions/workflows/ci.yml/badge.svg)](https://github.com/Nicholas-Nguyen8742/rust-vtiles/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![MSRV](https://img.shields.io/badge/rustc-1.75+-orange.svg)](rust-toolchain.toml)
+
 An end-to-end pipeline that ingests CRE geospatial datasets (parcels, zoning,
 flood zones, submarkets, asset points) from GeoJSON and Shapefiles, converts
 them to **Mapbox Vector Tiles (MVT v2)**, and publishes them for CDN
@@ -229,3 +233,7 @@ make seed       # push every fixture through the running local API
 CRE layer categories: parcels (one with a hole + a PII field to exercise
 stripping), asset points, flood zones, and submarkets. The end-to-end tests
 run against them.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
