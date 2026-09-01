@@ -1,0 +1,80 @@
+# Local stack for the vector tile pipeline (walkthrough: docs/LOCAL_DEV.md).
+#
+# The default profile is filesystem-backed — the local mirror of the TRD §6 S3
+# layout. ./data is mounted into the containers, so jobs, tiles, manifests,
+# and quarantine entries created inside containers are visible to the host's
+# make targets (and vice versa).
+#
+#   docker compose up -d --build          # api + worker
+#   docker compose --profile aws up -d    # + MinIO (S3 emulation, see below)
+#
+# DynamoDB Local and SQS are intentionally absent: every TRD store sits behind
+# a trait (JobStore, LayerCatalog, EventEmitter, QuarantineStore) and the local
+# implementations are filesystem-backed, so there is no code path that speaks
+# DynamoDB or SQS today. When those adapters land, add the emulators here.
+
+services:
+  api:
+    build: .
+    image: vtile:local
+    command: ["vtile-api", "--data-dir", "/data", "--host", "0.0.0.0", "--port", "8080"]
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/data
+    environment:
+      RUST_LOG: vtile_api=info,vtile_pipeline=info
+
+  # Idle worker shell: run the tile processor CLI against the same data root,
+  # e.g. `docker compose exec worker vtile job-status --data-dir /data --job-id job_...`
+  worker:
+    build: .
+    image: vtile:local
+    entrypoint:
+      [
+        "sh",
+        "-c",
+        "echo 'vtile worker ready: docker compose exec worker vtile <subcommand>' && tail -f /dev/null",
+      ]
+    volumes:
+      - ./data:/data
+    environment:
+      RUST_LOG: info
+
+  # --- Optional S3 emulation (profile "aws") -------------------------------
+  # Reserved for the S3 tile sink (vtile-pipeline built with --features aws;
+  # aws_config::load_from_env honors AWS_ENDPOINT_URL). The default local flow
+  # does not use it. Buckets mirror the TRD §6 staging/tiles split.
+  minio:
+    image: minio/minio:latest
+    profiles: ["aws"]
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  createbuckets:
+    image: minio/mc:latest
+    profiles: ["aws"]
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 minioadmin minioadmin &&
+      mc mb -p local/cre-geo-staging-dev local/cre-geo-tiles-dev &&
+      echo 'buckets ready: cre-geo-staging-dev, cre-geo-tiles-dev'
+      "
+
+volumes:
+  minio-data:

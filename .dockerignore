@@ -1,0 +1,20 @@
+# Keep the Docker build context small and deterministic.
+
+# Build output and local runtime state (mounted as a volume instead).
+target/
+data/
+
+# VCS / OS noise.
+.git/
+.gitignore
+.DS_Store
+
+# Local-stack definitions are not needed to build the binaries.
+docker-compose.yml
+.dockerignore
+
+# Generated binary fixtures are host-side test inputs, not image content.
+tests/fixtures/*.zip
+
+# Infrastructure-as-code is deployed separately (terraform/).
+terraform/
