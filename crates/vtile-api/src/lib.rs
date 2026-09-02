@@ -8,6 +8,9 @@
 //! * `GET  /api/v1/layers` (§8.3), `GET /api/v1/layers/:layer_id` (§8.4)
 //! * `POST /api/v1/ops/layers/:layer_id/rollback` — atomic version rollback
 //!   (Sequence 2 US-AP-05)
+//! * `POST /api/v1/ops/jobs/:job_id/replay` — authorized idempotent replay
+//!   (Sequence 3 US-04), `GET /api/v1/ops/dlq` — dead-letter inspection
+//!   (Sequence 3 US-06)
 //! * `GET  /tiles/:tenant/:layer/:z/:x/:y.pbf` (§8.5),
 //!   `GET /tiles/:tenant/:layer/versions/:version/:z/:x/:y.pbf` (Sequence 2
 //!   US-AP-04 explicit-version read path)
@@ -60,6 +63,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/v1/ops/layers/:layer_id/rollback",
             post(routes::ops::rollback_layer),
         )
+        .route(
+            "/api/v1/ops/jobs/:job_id/replay",
+            post(routes::ops::replay_job),
+        )
+        .route("/api/v1/ops/dlq", get(routes::ops::list_dlq))
         .route(
             "/tiles/:tenant/:layer/:z/:x/:y",
             get(routes::tiles::get_tile),

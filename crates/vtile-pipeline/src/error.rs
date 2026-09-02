@@ -54,6 +54,12 @@ pub enum PipelineError {
     #[error("rollback failed: {0}")]
     RollbackFailed(String),
 
+    /// Sequence 3 US-03: replay refused — the original failure is permanent
+    /// (fix the source and submit a new upload), the replay limit is
+    /// exhausted, or the job is cancelled (`REPLAY_NOT_ALLOWED`).
+    #[error("replay not allowed: {0}")]
+    ReplayNotAllowed(String),
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 

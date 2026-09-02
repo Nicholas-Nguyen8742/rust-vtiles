@@ -253,6 +253,14 @@ pub struct JobRecord {
     /// where in the TRD §10 state machine the job stopped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failed_stage: Option<String>,
+    /// Sequence 3 US-03: class of the recorded failure — `TRANSIENT`,
+    /// `PERMANENT_VALIDATION`, `PERMISSION_DENIED`, or `MANUAL_REVIEW`
+    /// (docs/RECOVERY.md).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_class: Option<String>,
+    /// Sequence 3 US-03: whether this failure may be replayed.
+    #[serde(default)]
+    pub replay_eligible: bool,
     /// Sequence 1 US-01: `sha256:` idempotency key of the upload request —
     /// SHA-256(tenantId + layerId + client token + processing profile).
     /// Duplicate upload requests with the same key return this job instead of
@@ -289,6 +297,10 @@ pub struct JobRecord {
     /// Sequence 1 US-05: audit record of the most recent replay.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replay_audit: Option<ReplayAudit>,
+    /// Sequence 3 US-04: manual replay attempts consumed; bounded by
+    /// `recovery::MAX_MANUAL_REPLAYS` before a new upload is required.
+    #[serde(default)]
+    pub replay_count: u64,
     /// Populated when the job completes (feature count, tile count, bbox...).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<JobOutcomeSummary>,

@@ -19,13 +19,15 @@ CREATE_NEW_VERSION ?= 0
 # Sequence 2 US-AP-05 rollback fields.
 LAYER          ?=
 TARGET_VERSION ?=
+# Sequence 3 US-06: scope the DLQ listing (empty = all tenants).
+DLQ_TENANT     ?=
 
 RELEASE := target/release
 
 .DEFAULT_GOAL := help
 
 .PHONY: help build fixtures setup setup-docker run-local run-local-docker \
-        seed job-status smoke replay-job rollback-layer metrics test clean distclean
+        seed job-status smoke replay-job rollback-layer dlq metrics test clean distclean
 
 help: ## Show available targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
@@ -77,6 +79,13 @@ replay-job: ## Replay a job: make replay-job JOB_ID=job_... [ASSUME_WGS84=1] [CR
 
 metrics: ## Idempotency telemetry snapshot from the running API
 	curl -s "http://$(HOST):$(PORT)/internal/metrics"
+
+dlq: ## List dead-lettered jobs: make dlq [DLQ_TENANT=tenant-acme]
+	@if [ -x "$(RELEASE)/vtile" ]; then \
+		"$(RELEASE)/vtile" dlq list --data-dir $(DATA_DIR) $(if $(DLQ_TENANT),--tenant $(DLQ_TENANT),); \
+	else \
+		cargo run -q -p vtile-pipeline --bin vtile -- dlq list --data-dir $(DATA_DIR) $(if $(DLQ_TENANT),--tenant $(DLQ_TENANT),); \
+	fi
 
 rollback-layer: ## Roll back a layer: make rollback-layer LAYER=l TARGET_VERSION=v REASON="..."
 	@test -n "$(LAYER)" -a -n "$(TARGET_VERSION)" || { echo "usage: make rollback-layer TENANT=$(TENANT) LAYER=<layerId> TARGET_VERSION=<version> REASON=\"...\""; exit 2; }

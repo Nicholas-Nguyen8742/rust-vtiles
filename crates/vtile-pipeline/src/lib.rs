@@ -20,6 +20,7 @@ pub mod job;
 pub mod manifest;
 pub mod publish;
 pub mod quarantine;
+pub mod recovery;
 pub mod replay;
 pub mod sink_local;
 #[cfg(feature = "aws")]
@@ -32,7 +33,7 @@ pub use idempotency::{
     upload_idempotency_key, DedupeRecord, DedupeStore, EventDecision, FileDedupeStore,
     FileOrphanStore, IdempotencyMetrics, Metric, OrphanEvent,
 };
-pub use job::{run_job, JobDeps, RunJobInput};
+pub use job::{new_replay_id, run_job, JobDeps, RunJobInput};
 pub use manifest::TileManifest;
 pub use publish::{
     aggregate_checksum, promote_layer_version, read_candidate_manifest, rollback_layer_version,
@@ -41,5 +42,10 @@ pub use publish::{
     PublishMetric, PublishMetrics, PublishStatus, TileEntry, PIPELINE_ACTOR,
 };
 pub use quarantine::{ErrorReport, FileQuarantineStore, QuarantineStore};
-pub use replay::{replay_job, ReplayOptions};
+pub use recovery::{
+    classify_code, dead_letter_failure, remediation_for, replay_eligible, run_job_with_retries,
+    DlqRecord, DlqStore, ErrorClass, FileDlqStore, RecoveryMetric, RecoveryMetrics, RetryPolicy,
+    MAX_MANUAL_REPLAYS,
+};
+pub use replay::{replay_job, ReplayOptions, ReplayOutcome};
 pub use store::Lease;

@@ -109,3 +109,45 @@ pub struct RollbackRequest {
     pub target_tile_version: String,
     pub reason: String,
 }
+
+/// `POST /api/v1/ops/jobs/{jobId}/replay` request (Sequence 3 US-04).
+/// `reason` is mandatory (auditability); `requestedBy` defaults to
+/// the authenticated caller when omitted.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplayJobRequest {
+    pub reason: String,
+    #[serde(default)]
+    pub requested_by: Option<String>,
+    /// Assume EPSG:4326 for `UNKNOWN_CRS` failures (TRD §10 confirmation).
+    #[serde(default)]
+    pub assume_crs_wgs84: bool,
+    /// Replay a `COMPLETED` job as an explicit new-version publish.
+    #[serde(default)]
+    pub create_new_version: bool,
+}
+
+/// `POST /api/v1/ops/jobs/{jobId}/replay` response.
+///
+/// `status` is `REPLAY_ACCEPTED` (202, replay running under the original
+/// jobId) or `REPLAY_NO_OP` (200, original job already completed).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplayJobResponse {
+    pub original_job_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replay_id: Option<String>,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// `GET /api/v1/ops/dlq` query parameters (Sequence 3 US-06).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DlqListQuery {
+    pub tenant_id: Option<String>,
+}

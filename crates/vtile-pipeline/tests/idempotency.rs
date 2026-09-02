@@ -23,8 +23,11 @@ use vtile_pipeline::idempotency::{
 };
 use vtile_pipeline::job::{job_paths_for, run_job, JobDeps, RunJobInput};
 use vtile_pipeline::quarantine::FileQuarantineStore;
+use vtile_pipeline::recovery::FileDlqStore;
 use vtile_pipeline::store::{FileJobStore, FileLayerCatalog, JobStore, LayerCatalog};
-use vtile_pipeline::{replay_job, ErrorReport, PipelineError, QuarantineStore, ReplayOptions};
+use vtile_pipeline::{
+    replay_job, ErrorReport, PipelineError, QuarantineStore, ReplayOptions, ReplayOutcome,
+};
 use vtile_pipeline::events::NullEventEmitter;
 
 const TENANT: &str = "tenant-acme";
@@ -51,6 +54,8 @@ fn base_job(job_id: &str) -> JobRecord {
         error: None,
         error_code: None,
         failed_stage: None,
+        error_class: None,
+        replay_eligible: false,
         idempotency_key: None,
         request_fingerprint: None,
         event_dedupe_fingerprint: None,
@@ -61,6 +66,7 @@ fn base_job(job_id: &str) -> JobRecord {
         duplicate_event_count: 0,
         requested_tile_version: None,
         replay_audit: None,
+        replay_count: 0,
         outcome: None,
         layer_input: Some(LayerMetadataInput {
             name: Some("NYC Parcels".to_string()),
@@ -77,6 +83,7 @@ fn deps(root: &std::path::Path) -> JobDeps {
         catalog: Arc::new(FileLayerCatalog::new(root.join("catalog.json")).unwrap()),
         events: Arc::new(NullEventEmitter),
         quarantine: Some(Arc::new(FileQuarantineStore::new(root.join("quarantine")))),
+        dlq: Some(Arc::new(FileDlqStore::new(root.join("dlq")))),
     }
 }
 
@@ -393,6 +400,8 @@ fn replay_of_failed_job_records_audit_and_completes() {
 
     let mut job = base_job("job_replay_ok");
     job.status = JobStatus::Failed;
+    // run_job records the failure taxonomy on the job; mirror that here.
+    job.error_code = Some("UNKNOWN_CRS".to_string());
     jobs.create(job.clone()).unwrap();
     let report = ErrorReport::from_job(&job, "UNKNOWN_CRS", "x", "NORMALIZING");
     store
@@ -413,6 +422,8 @@ fn replay_of_failed_job_records_audit_and_completes() {
     assert_eq!(audit.requested_by, "sre-user");
     assert_eq!(audit.reason, "Transient Fargate timeout");
     assert!(!audit.create_new_version);
+    // Sequence 3 US-04: replay attempt counted.
+    assert_eq!(stored.replay_count, 1);
 }
 
 #[test]
@@ -422,7 +433,7 @@ fn replay_rules_completed_and_active_jobs() {
     let jobs = d.jobs.clone();
     let store = FileQuarantineStore::new(root.join("quarantine"));
 
-    // COMPLETED without createNewVersion → rejected.
+    // COMPLETED without createNewVersion → no-op (Sequence 3 US-05).
     let mut completed = base_job("job_done");
     completed.status = JobStatus::Completed;
     jobs.create(completed.clone()).unwrap();
@@ -430,8 +441,12 @@ fn replay_rules_completed_and_active_jobs() {
     store
         .quarantine(&completed, &tiny_parcel_geojson(), &report)
         .unwrap();
-    let err = replay_job(&d, &root, TENANT, "job_done", &ReplayOptions::default()).unwrap_err();
-    assert!(err.to_string().contains("createNewVersion"), "got: {err}");
+    let outcome = replay_job(&d, &root, TENANT, "job_done", &ReplayOptions::default())
+        .expect("completed replay returns a no-op, not an error");
+    assert!(
+        matches!(outcome, ReplayOutcome::NoOp { .. }),
+        "completed replay must be a no-op"
+    );
 
     // Active (Queued) job → JOB_ALREADY_ACTIVE.
     let active = base_job("job_active");

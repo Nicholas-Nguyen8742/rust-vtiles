@@ -98,6 +98,77 @@ pub enum PipelineEvent {
         error_message: String,
         occurred_at: DateTime<Utc>,
     },
+    /// Sequence 3 US-01: a transient failure will be retried after a backoff
+    /// delay.
+    #[serde(rename = "vector.tile.job.retry_scheduled")]
+    VectorTileJobRetryScheduled {
+        event_id: String,
+        tenant_id: String,
+        job_id: String,
+        layer_id: String,
+        attempt: u32,
+        delay_secs: u64,
+        error_code: String,
+        occurred_at: DateTime<Utc>,
+    },
+    /// Sequence 3 US-01/US-06: retries exhausted (or non-retryable failure) —
+    /// the job was captured in the dead-letter queue.
+    #[serde(rename = "vector.tile.job.dead-lettered")]
+    VectorTileJobDeadLettered {
+        event_id: String,
+        tenant_id: String,
+        job_id: String,
+        layer_id: String,
+        error_code: String,
+        error_class: crate::recovery::ErrorClass,
+        failed_stage: String,
+        retry_count: u32,
+        occurred_at: DateTime<Utc>,
+    },
+    /// Sequence 3 US-02/US-06: a failed upload was quarantined with its
+    /// failure report.
+    #[serde(rename = "vector.tile.job.quarantined")]
+    VectorTileJobQuarantined {
+        event_id: String,
+        tenant_id: String,
+        job_id: String,
+        layer_id: String,
+        error_code: String,
+        quarantine_dir: String,
+        occurred_at: DateTime<Utc>,
+    },
+    /// Sequence 3 US-05: a replay finished successfully.
+    #[serde(rename = "vector.tile.job.replay.completed")]
+    VectorTileJobReplayCompleted {
+        event_id: String,
+        tenant_id: String,
+        job_id: String,
+        layer_id: String,
+        tile_version: String,
+        occurred_at: DateTime<Utc>,
+    },
+    /// Sequence 3 US-05/US-06: a replay attempt failed.
+    #[serde(rename = "vector.tile.job.replay.failed")]
+    VectorTileJobReplayFailed {
+        event_id: String,
+        tenant_id: String,
+        job_id: String,
+        layer_id: String,
+        error_code: String,
+        error_message: String,
+        occurred_at: DateTime<Utc>,
+    },
+    /// Sequence 3 US-03/US-06: a replay request was denied (permanent
+    /// failure class, replay limit, or job state).
+    #[serde(rename = "vector.tile.job.replay.denied")]
+    VectorTileJobReplayDenied {
+        event_id: String,
+        tenant_id: String,
+        job_id: String,
+        layer_id: String,
+        reason: String,
+        occurred_at: DateTime<Utc>,
+    },
 }
 
 impl PipelineEvent {
@@ -114,6 +185,14 @@ impl PipelineEvent {
                 "vector.tile.version.rolled_back"
             }
             PipelineEvent::VectorTilePublishFailed { .. } => "vector.tile.publish.failed",
+            PipelineEvent::VectorTileJobRetryScheduled { .. } => "vector.tile.job.retry_scheduled",
+            PipelineEvent::VectorTileJobDeadLettered { .. } => "vector.tile.job.dead-lettered",
+            PipelineEvent::VectorTileJobQuarantined { .. } => "vector.tile.job.quarantined",
+            PipelineEvent::VectorTileJobReplayCompleted { .. } => {
+                "vector.tile.job.replay.completed"
+            }
+            PipelineEvent::VectorTileJobReplayFailed { .. } => "vector.tile.job.replay.failed",
+            PipelineEvent::VectorTileJobReplayDenied { .. } => "vector.tile.job.replay.denied",
         }
     }
 }

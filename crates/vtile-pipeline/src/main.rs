@@ -14,6 +14,7 @@
 //!     --assume-wgs84 --requested-by sre-user --reason "Transient Fargate timeout"
 //! vtile rollback --data-dir ./data --tenant tenant-acme --layer us-parcels-nyc \
 //!     --target-version 2026-06-17T14-30-00Z-abcd1234 --reason "Misaligned parcel refresh"
+//! vtile dlq list --data-dir ./data [--tenant tenant-acme]
 //! ```
 
 use std::fs;
@@ -30,9 +31,11 @@ use vtile_pipeline::events::LoggingEventEmitter;
 use vtile_pipeline::job::{
     job_paths_for, new_idempotency_token, new_job_id, new_tile_version, run_job, RunJobInput,
 };
+use vtile_pipeline::recovery::{run_job_with_retries, FileDlqStore, RetryPolicy};
 use vtile_pipeline::store::{FileJobStore, FileLayerCatalog, JobStore};
 use vtile_pipeline::{
     processing_profile_label, upload_idempotency_key, FileQuarantineStore, JobDeps, ReplayOptions,
+    ReplayOutcome,
 };
 
 #[derive(Parser)]
@@ -138,6 +141,23 @@ enum Command {
         #[arg(long, default_value = "cli")]
         requested_by: String,
     },
+    /// Inspect the dead-letter queue (Sequence 3 US-01/US-06).
+    Dlq {
+        #[command(subcommand)]
+        command: DlqCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum DlqCommand {
+    /// List dead-lettered jobs, optionally scoped to one tenant.
+    List {
+        #[arg(long, default_value = "./data")]
+        data_dir: PathBuf,
+        /// Filter by tenant (omit for all tenants).
+        #[arg(long)]
+        tenant: Option<String>,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -239,6 +259,9 @@ fn main() -> Result<()> {
             reason,
             requested_by,
         ),
+        Command::Dlq { command } => match command {
+            DlqCommand::List { data_dir, tenant } => dlq_list(data_dir, tenant),
+        },
     }
 }
 
@@ -253,6 +276,8 @@ fn build_deps(data_dir: &PathBuf) -> Result<JobDeps> {
         quarantine: Some(Arc::new(FileQuarantineStore::new(
             data_dir.join("quarantine"),
         ))),
+        // Sequence 3 US-01: dead-letter capture lives under `dlq/`.
+        dlq: Some(Arc::new(FileDlqStore::new(data_dir.join("dlq")))),
     })
 }
 
@@ -313,6 +338,8 @@ fn run(
         error: None,
         error_code: None,
         failed_stage: None,
+        error_class: None,
+        replay_eligible: false,
         // Sequence 1 US-01: CLI runs are intentional one-shot uploads — a
         // server-minted token gives each run its own idempotency key.
         idempotency_key: Some(upload_idempotency_key(
@@ -330,6 +357,7 @@ fn run(
         duplicate_event_count: 0,
         requested_tile_version: Some(new_tile_version()),
         replay_audit: None,
+        replay_count: 0,
         outcome: None,
         layer_input: None,
     };
@@ -393,7 +421,7 @@ fn run(
         normalize_opts,
         paths: job_paths_for(&data_dir, &tenant, &job_id, &layer),
     };
-    let outcome = run_job(&input, &deps)?;
+    let outcome = run_job_with_retries(&input, &deps, &RetryPolicy::default())?;
 
     println!(
         "{}",
@@ -431,13 +459,17 @@ fn job_status(data_dir: PathBuf, job_id: String) -> Result<()> {
         "error": job.error,
         "errorCode": job.error_code,
         "failedStage": job.failed_stage,
+        "errorClass": job.error_class,
+        "replayEligible": job.replay_eligible,
+        "replayCount": job.replay_count,
     });
     println!("{}", serde_json::to_string_pretty(&response)?);
     Ok(())
 }
 
 /// Replays a failed, quarantined job (Recommendation 3 US-03) under the
-/// Sequence 1 US-05 guardrails and audit trail.
+/// Sequence 1 US-05 guardrails, Sequence 3 eligibility/limit checks, and
+/// audit trail.
 #[allow(clippy::too_many_arguments)]
 fn replay(
     data_dir: PathBuf,
@@ -461,18 +493,58 @@ fn replay(
             create_new_version,
         },
     )?;
-    println!(
-        "{}",
-        serde_json::json!({
-            "jobId": job_id,
-            "status": "COMPLETED",
-            "featureCount": outcome.feature_count,
-            "tileCount": outcome.tile_count,
-            "tileVersion": outcome.tile_version,
-            "bbox": outcome.bbox.to_vec(),
-            "warnings": outcome.warnings,
-        })
-    );
+    match outcome {
+        ReplayOutcome::Executed(outcome) => {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "jobId": job_id,
+                    "status": "COMPLETED",
+                    "featureCount": outcome.feature_count,
+                    "tileCount": outcome.tile_count,
+                    "tileVersion": outcome.tile_version,
+                    "bbox": outcome.bbox.to_vec(),
+                    "warnings": outcome.warnings,
+                })
+            );
+        }
+        ReplayOutcome::NoOp { reason } => {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "jobId": job_id,
+                    "status": "REPLAY_NO_OP",
+                    "reason": reason,
+                })
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Lists dead-lettered jobs (Sequence 3 US-01/US-06), optionally scoped to
+/// one tenant.
+fn dlq_list(data_dir: PathBuf, tenant: Option<String>) -> Result<()> {
+    use vtile_pipeline::DlqStore;
+    let store = FileDlqStore::new(data_dir.join("dlq"));
+    let records = match &tenant {
+        Some(t) => store.list_tenant(t)?,
+        None => {
+            // No tenant filter: walk every tenant directory under dlq/.
+            let mut all = Vec::new();
+            let root = data_dir.join("dlq");
+            if let Ok(entries) = std::fs::read_dir(&root) {
+                for entry in entries.flatten() {
+                    if entry.path().is_dir() {
+                        let name = entry.file_name().to_string_lossy().to_string();
+                        all.extend(store.list_tenant(&name)?);
+                    }
+                }
+            }
+            all
+        }
+    };
+    println!("{}", serde_json::to_string_pretty(&records)?);
     Ok(())
 }
 

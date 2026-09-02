@@ -1,16 +1,23 @@
-//! Ops routes: layer version rollback (Sequence 2 US-AP-05).
+//! Ops routes: layer version rollback (Sequence 2 US-AP-05), authorized job
+//! replay, and DLQ inspection (Sequence 3 US-04/US-06).
 
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
+use chrono::Utc;
 
+use vtile_core::model::JobStatus;
 use vtile_pipeline::publish::{rollback_layer_version, LayerVersionRecord};
-use vtile_pipeline::PipelineError;
+use vtile_pipeline::recovery::{FileDlqStore, DlqRecord, DlqStore, MAX_MANUAL_REPLAYS};
+use vtile_pipeline::{
+    new_replay_id, replay_job as run_replay_job, FileQuarantineStore, JobDeps, PipelineError,
+    ReplayOptions, ReplayOutcome,
+};
 
 use crate::auth;
-use crate::dto::RollbackRequest;
+use crate::dto::{DlqListQuery, ReplayJobRequest, ReplayJobResponse, RollbackRequest};
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -103,4 +110,189 @@ pub async fn rollback_layer(
         "layer rolled back"
     );
     Ok((StatusCode::OK, Json(record)))
+}
+
+/// `POST /api/v1/ops/jobs/:job_id/replay` — authorized replay of a failed
+/// job under its original identity (Sequence 3 US-04).
+///
+/// Governance: `reason` is mandatory and recorded with the actor; production
+/// restricts this route to operational roles via RBAC. Response is one of:
+/// * `202 REPLAY_ACCEPTED` — replay started asynchronously (`replayId`
+///   tracks the attempt), the job runs under its original `jobId`).
+/// * `200 REPLAY_NO_OP` — the original job already completed successfully
+///   (Sequence 3 US-05).
+/// * `409 JOB_ALREADY_ACTIVE` — the job is still being processed.
+/// * `422 REPLAY_NOT_ALLOWED` — permanent failure class, replay limit
+///   exhausted, or cancelled job.
+pub async fn replay_job(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(job_id): Path<String>,
+    Json(req): Json<ReplayJobRequest>,
+) -> Result<(StatusCode, Json<ReplayJobResponse>), ApiError> {
+    let job = state
+        .jobs
+        .get(&job_id)?
+        .ok_or_else(|| ApiError::not_found("JOB_NOT_FOUND", format!("job {job_id} not found")))?;
+    // Tenant isolation (TRD §13): callers may only replay their own jobs.
+    if let Some(tenant) = auth::authorized_tenant(&state, &headers) {
+        if tenant != job.tenant_id {
+            return Err(ApiError::forbidden(format!(
+                "tenant {tenant} cannot replay job {job_id}"
+            )));
+        }
+    }
+
+    let reason = req.reason.trim().to_string();
+    if reason.is_empty() {
+        return Err(ApiError::bad_request(
+            "INVALID_REQUEST",
+            "reason is required for replay (auditability, US-AP-06)",
+        ));
+    }
+    let requested_by = req
+        .requested_by
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            auth::authorized_tenant(&state, &headers)
+                .map(|t| format!("api:{t}"))
+                .or(Some("api:operator".to_string()))
+        })
+        .unwrap_or_else(|| "api:operator".to_string());
+
+    // Sequence 3 US-05: replay of an already-successful job is a no-op.
+    if job.status == JobStatus::Completed {
+        return Ok((
+            StatusCode::OK,
+            Json(ReplayJobResponse {
+                original_job_id: job_id,
+                replay_id: None,
+                status: "REPLAY_NO_OP".to_string(),
+                idempotency_key: job.idempotency_key,
+                reason: Some("original job already completed successfully".to_string()),
+                created_at: Utc::now(),
+            }),
+        ));
+    }
+    if job.status == JobStatus::Cancelled {
+        return Err(ApiError::unprocessable(
+            "REPLAY_NOT_ALLOWED",
+            "cancelled jobs cannot be replayed",
+        ));
+    }
+    if job.status != JobStatus::Failed {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "JOB_ALREADY_ACTIVE",
+            format!("job {job_id} is {}", job.status.as_str()),
+        ));
+    }
+    // Sequence 3 US-03: eligibility is enforced server-side.
+    if !job.replay_eligible {
+        return Err(ApiError::unprocessable(
+            "REPLAY_NOT_ALLOWED",
+            format!(
+                "original job failed permanent validation ({:?}); correct the source data and submit a new upload",
+                job.error_code
+            ),
+        ));
+    }
+    // Sequence 3 US-04: bounded manual replays.
+    if job.replay_count >= MAX_MANUAL_REPLAYS {
+        return Err(ApiError::unprocessable(
+            "REPLAY_NOT_ALLOWED",
+            format!(
+                "job {job_id} reached the maximum of {MAX_MANUAL_REPLAYS} manual replays; submit a new upload"
+            ),
+        ));
+    }
+
+    let replay_id = new_replay_id();
+    // assume-WGS84: request flag wins; otherwise the upload-time tag
+    // convention (TRD §10 user confirmation).
+    let tagged = job
+        .layer_input
+        .as_ref()
+        .map(|m| m.tags.iter().any(|t| t == "assume-wgs84"))
+        .unwrap_or(false);
+    let assume_wgs84 = req.assume_crs_wgs84 || tagged;
+    let tenant_id = job.tenant_id.clone();
+    let replay_job_id = job.job_id.clone();
+
+    let deps = JobDeps {
+        jobs: state.jobs.clone(),
+        catalog: state.catalog.clone(),
+        events: state.events.clone(),
+        quarantine: Some(Arc::new(FileQuarantineStore::new(
+            state.data_dir.join("quarantine"),
+        ))),
+        dlq: Some(Arc::new(FileDlqStore::new(state.data_dir.join("dlq")))),
+    };
+    let data_dir = state.data_dir.clone();
+    let create_new_version = req.create_new_version;
+    let response = ReplayJobResponse {
+        original_job_id: job_id.clone(),
+        replay_id: Some(replay_id.clone()),
+        status: "REPLAY_ACCEPTED".to_string(),
+        idempotency_key: job.idempotency_key.clone(),
+        reason: None,
+        created_at: Utc::now(),
+    };
+
+    tokio::task::spawn_blocking(move || {
+        let outcome = run_replay_job(
+            &deps,
+            &data_dir,
+            &tenant_id,
+            &replay_job_id,
+            &ReplayOptions {
+                assume_wgs84,
+                requested_by,
+                reason,
+                create_new_version,
+            },
+        );
+        match outcome {
+            Ok(ReplayOutcome::Executed(_)) => {}
+            Ok(ReplayOutcome::NoOp { reason }) => {
+                tracing::info!(job_id = %replay_job_id, reason = %reason, "replay no-op");
+            }
+            Err(err) => {
+                tracing::error!(job_id = %replay_job_id, error = %err, "replay failed");
+            }
+        }
+    });
+
+    Ok((StatusCode::ACCEPTED, Json(response)))
+}
+
+/// `GET /api/v1/ops/dlq` — tenant-scoped dead-letter queue inspection
+/// (Sequence 3 US-06). When token auth is enabled the caller is pinned to
+/// their own tenant regardless of the query string (TRD §13).
+pub async fn list_dlq(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<DlqListQuery>,
+) -> Result<Json<Vec<DlqRecord>>, ApiError> {
+    let store = FileDlqStore::new(state.data_dir.join("dlq"));
+    let tenant = auth::authorized_tenant(&state, &headers).or(query.tenant_id);
+    let records = match &tenant {
+        Some(t) => store.list_tenant(t)?,
+        None => {
+            let mut all = Vec::new();
+            let root = state.data_dir.join("dlq");
+            if let Ok(entries) = std::fs::read_dir(&root) {
+                for entry in entries.flatten() {
+                    if entry.path().is_dir() {
+                        let name = entry.file_name().to_string_lossy().to_string();
+                        all.extend(store.list_tenant(&name)?);
+                    }
+                }
+            }
+            all.sort_by(|a, b| b.failed_at.cmp(&a.failed_at));
+            all
+        }
+    };
+    Ok(Json(records))
 }

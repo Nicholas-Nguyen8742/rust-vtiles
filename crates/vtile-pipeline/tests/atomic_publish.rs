@@ -25,6 +25,7 @@ use vtile_pipeline::publish::{
     PublishStatus, TileEntry, PIPELINE_ACTOR,
 };
 use vtile_pipeline::quarantine::FileQuarantineStore;
+use vtile_pipeline::recovery::FileDlqStore;
 use vtile_pipeline::store::{FileJobStore, FileLayerCatalog};
 use vtile_pipeline::PipelineError;
 
@@ -73,6 +74,8 @@ fn base_job(job_id: &str) -> JobRecord {
         error: None,
         error_code: None,
         failed_stage: None,
+        error_class: None,
+        replay_eligible: false,
         idempotency_key: None,
         request_fingerprint: None,
         event_dedupe_fingerprint: None,
@@ -83,6 +86,7 @@ fn base_job(job_id: &str) -> JobRecord {
         duplicate_event_count: 0,
         requested_tile_version: None,
         replay_audit: None,
+        replay_count: 0,
         outcome: None,
         layer_input: Some(LayerMetadataInput {
             name: Some("NYC Parcels".to_string()),
@@ -128,6 +132,7 @@ fn deps(root: &Path, emitter: Arc<dyn EventEmitter>) -> JobDeps {
         catalog: Arc::new(FileLayerCatalog::new(root.join("catalog.json")).unwrap()),
         events: emitter,
         quarantine: Some(Arc::new(FileQuarantineStore::new(root.join("quarantine")))),
+        dlq: Some(Arc::new(FileDlqStore::new(root.join("dlq")))),
     }
 }
 

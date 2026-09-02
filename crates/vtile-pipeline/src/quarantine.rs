@@ -32,8 +32,9 @@ pub const INPUT_FILE_NAME: &str = "input.bin";
 pub const REPORT_FILE_NAME: &str = "error-report.json";
 
 /// Machine-readable failure report stored next to the quarantined input
-/// (Recommendation 3 US-02/US-03: the DLQ payload includes the `jobId`,
-/// source URI, and the classified error).
+/// (Recommendation 3 US-02/US-03 + Sequence 3 US-02: the report carries the
+/// classified error, replay eligibility, and remediation guidance so source
+/// problems can be diagnosed without log archaeology).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ErrorReport {
@@ -48,6 +49,20 @@ pub struct ErrorReport {
     pub error_message: String,
     /// Workflow stage where the job stopped, e.g. `NORMALIZING`.
     pub failed_stage: String,
+    /// Sequence 3 US-03: `TRANSIENT` / `PERMANENT_VALIDATION` /
+    /// `PERMISSION_DENIED` / `MANUAL_REVIEW` (docs/RECOVERY.md).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_class: Option<String>,
+    /// Sequence 3 US-03: whether `vtile replay` is allowed for this failure.
+    #[serde(default)]
+    pub replay_eligible: bool,
+    /// Sequence 3 US-02: operator-facing remediation guidance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remediation: Option<String>,
+    /// Location of the quarantined source bytes (Sequence 3 US-02
+    /// `quarantineUri`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quarantine_uri: Option<String>,
     pub quarantined_at: DateTime<Utc>,
 }
 
@@ -68,6 +83,10 @@ impl ErrorReport {
             error_code: error_code.to_string(),
             error_message: error_message.to_string(),
             failed_stage: failed_stage.to_string(),
+            error_class: Some(crate::recovery::classify_code(error_code).as_str().to_string()),
+            replay_eligible: crate::recovery::replay_eligible(Some(error_code)),
+            remediation: Some(crate::recovery::remediation_for(error_code).to_string()),
+            quarantine_uri: None,
             quarantined_at: Utc::now(),
         }
     }
@@ -124,11 +143,14 @@ impl QuarantineStore for FileQuarantineStore {
         let dir = self.dir_for(&job.tenant_id, &job.job_id);
         fs::create_dir_all(&dir)?;
         fs::write(dir.join(INPUT_FILE_NAME), source_bytes)?;
-        // Atomic report write (tmp + rename) so readers never observe a
-        // partial JSON document.
+        // Enrich the report with the quarantine location (Sequence 3 US-02
+        // `quarantineUri`), then write atomically (tmp + rename) so readers
+        // never observe a partial JSON document.
+        let mut report = report.clone();
+        report.quarantine_uri = Some(dir.join(INPUT_FILE_NAME).display().to_string());
         let report_path = dir.join(REPORT_FILE_NAME);
         let tmp = report_path.with_extension("json.tmp");
-        fs::write(&tmp, serde_json::to_string_pretty(report)?)?;
+        fs::write(&tmp, serde_json::to_string_pretty(&report)?)?;
         fs::rename(&tmp, report_path)?;
         Ok(dir)
     }

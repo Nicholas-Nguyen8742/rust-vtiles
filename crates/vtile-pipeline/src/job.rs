@@ -26,6 +26,7 @@ use crate::events::{EventEmitter, PipelineEvent};
 use crate::manifest::TileManifest;
 use crate::publish::{self, CandidateManifest};
 use crate::quarantine::{ErrorReport, QuarantineStore};
+use crate::recovery::{DlqStore, RecoveryMetric, RecoveryMetrics};
 use crate::sink_local::LocalTileSink;
 use crate::store::{JobStore, LayerCatalog};
 
@@ -79,6 +80,9 @@ pub struct JobDeps {
     /// Optional quarantine for failed uploads (Recommendation 3 US-03).
     /// `None` disables quarantine (e.g. unit tests).
     pub quarantine: Option<Arc<dyn QuarantineStore>>,
+    /// Optional dead-letter store (Sequence 3 US-01). `None` disables DLQ
+    /// capture (e.g. unit tests).
+    pub dlq: Option<Arc<dyn DlqStore>>,
 }
 
 /// Everything needed to run one job.
@@ -177,6 +181,11 @@ pub fn run_job(input: &RunJobInput, deps: &JobDeps) -> PipelineResult<JobOutcome
                     record.error = Some(message.clone());
                     record.error_code = Some(code.clone());
                     record.failed_stage = Some(failed_stage.clone());
+                    // Sequence 3 US-03: classify for DLQ/replay handling.
+                    record.error_class = Some(
+                        crate::recovery::classify_code(&code).as_str().to_string(),
+                    );
+                    record.replay_eligible = crate::recovery::replay_eligible(Some(code.as_str()));
                     record.state_version += 1;
                     record.lease_token = None;
                     record.locked_by = None;
@@ -199,11 +208,25 @@ pub fn run_job(input: &RunJobInput, deps: &JobDeps) -> PipelineResult<JobOutcome
                 if let Some(quarantine) = deps.quarantine.as_ref() {
                     let report = ErrorReport::from_job(job, &code, &message, &failed_stage);
                     match quarantine.quarantine(job, &input.source_bytes, &report) {
-                        Ok(dir) => info!(
-                            job_id = %job.job_id,
-                            quarantine = %dir.display(),
-                            "source quarantined for replay"
-                        ),
+                        Ok(dir) => {
+                            info!(
+                                job_id = %job.job_id,
+                                quarantine = %dir.display(),
+                                "source quarantined for replay"
+                            );
+                            // Sequence 3 US-02/US-06: quarantine audit event +
+                            // telemetry.
+                            RecoveryMetrics::global().inc(RecoveryMetric::QuarantinedObjects);
+                            deps.events.emit(PipelineEvent::VectorTileJobQuarantined {
+                                event_id: new_event_id(),
+                                tenant_id: job.tenant_id.clone(),
+                                job_id: job.job_id.clone(),
+                                layer_id: job.layer_id.clone(),
+                                error_code: code.clone(),
+                                quarantine_dir: dir.display().to_string(),
+                                occurred_at: Utc::now(),
+                            });
+                        }
                         Err(qe) => tracing::error!(
                             job_id = %job.job_id,
                             error = %qe,
@@ -471,6 +494,7 @@ pub fn error_classification(err: &PipelineError) -> (String, String) {
         PipelineError::PublishValidation(_) => "PUBLISH_VALIDATION_FAILED",
         PipelineError::PromotionConflict(_) => "PROMOTION_CONFLICT",
         PipelineError::RollbackFailed(_) => "ROLLBACK_FAILED",
+        PipelineError::ReplayNotAllowed(_) => "REPLAY_NOT_ALLOWED",
         _ => "PIPELINE_ERROR",
     };
     (code.to_string(), err.to_string())
@@ -520,6 +544,12 @@ pub fn new_idempotency_token() -> String {
 
 pub fn new_event_id() -> String {
     format!("evt_{}", uuid::Uuid::new_v4().as_simple())
+}
+
+/// Sequence 3 US-04: unique identifier for one replay attempt, recorded in
+/// the replay log and the `REPLAY_ACCEPTED` response.
+pub fn new_replay_id() -> String {
+    format!("replay_{}", uuid::Uuid::new_v4().as_simple())
 }
 
 pub fn new_job_id() -> String {

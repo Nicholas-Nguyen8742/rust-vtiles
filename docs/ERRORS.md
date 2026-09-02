@@ -69,6 +69,7 @@ are detailed in [`PUBLISHING.md`](PUBLISHING.md).
 | `PUBLISH_VALIDATION_FAILED` | 500 | `PUBLISHING` | Candidate version failed the completeness gate (tile count, zero-byte, zoom coverage, aggregate checksum). The previous published version stays live; fix the source and re-publish (Sequence 2 US-AP-02) |
 | `PROMOTION_CONFLICT` | 500 | `PUBLISHING` | Conditional promotion lost — the layer's authoritative pointer moved underneath this publisher. Retry with a fresh candidate (Sequence 2 US-AP-03) |
 | `ROLLBACK_FAILED` | 500 | — | Rollback rejected: unknown layer, missing/corrupt target version, or no publication yet. Via the ops API this surfaces as `422 ROLLBACK_INVALID_TARGET` (Sequence 2 US-AP-05) |
+| `REPLAY_NOT_ALLOWED` | 500 (API: 422) | — | Replay refused (Sequence 3 US-03/US-04): the failure class is permanent (`PERMANENT_VALIDATION` other than `UNKNOWN_CRS`), the manual-replay limit (3) is exhausted, or the job is cancelled. Fix the source and submit a new upload — see `docs/RECOVERY.md` |
 | `PIPELINE_ERROR` | 500 | any | Other orchestration failure (unsupported format reaching the runner, missing bbox, replay preconditions, ...) |
 
 ## Upload-gate and serving responses (API layer)
@@ -81,6 +82,8 @@ These never reach the pipeline; they enforce the TRD §8/§13 contracts.
 | `UNSUPPORTED_FORMAT` | 422 | `POST /ingest/uploads` | `sourceFormat` outside MVP (GeoJSON/Shapefile only; KML/GeoPackage/FlatGeobuf are post-MVP) |
 | `IDEMPOTENCY_KEY_PAYLOAD_MISMATCH` | 409 | `POST /ingest/uploads` | `Idempotency-Key` reused with a different payload (Sequence 1 US-02) — fix the payload or mint a new key |
 | `ROLLBACK_INVALID_TARGET` | 422 | `POST /ops/layers/{id}/rollback` | Rollback target missing/corrupt, or the layer was never published (Sequence 2 US-AP-05). Missing `targetTileVersion`/`reason` → `400 INVALID_REQUEST` |
+| `JOB_ALREADY_ACTIVE` | 409 | `POST /ops/jobs/{id}/replay` | Replay attempted while the job is still being processed (Sequence 3 US-04) |
+| `REPLAY_NOT_ALLOWED` | 422 | `POST /ops/jobs/{id}/replay` | Permanent failure class, replay limit exhausted, or cancelled job (Sequence 3 US-03/US-04); the response carries remediation guidance |
 | `UNAUTHORIZED` | 401 | any (auth enabled) | Missing/invalid bearer token |
 | `FORBIDDEN` | 403 | jobs, tiles | Token tenant does not match the resource tenant (TRD §13 isolation) |
 | `JOB_NOT_FOUND` | 404 | `GET /jobs/{id}`, content PUT | Unknown job id; content PUTs for unknown jobs are also recorded under `data/orphans/` (Sequence 1 US-03) |

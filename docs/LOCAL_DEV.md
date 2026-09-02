@@ -73,6 +73,7 @@ data/                                  # local mirror of TRD §6 S3 prefixes
     manifest.json                      # compatibility publish pointer
     latest.json                        # atomic live pointer
     audit.jsonl                        # append-only publish/rollback audit
+  dlq/{tenantId}/{jobId}.json          # dead-lettered jobs (Sequence 3 US-01)
   quarantine/{tenantId}/{jobId}/
     input.bin                          # original upload bytes
     error-report.json                  # ErrorReport (code, stage, message, ...)
@@ -200,6 +201,34 @@ Rollback is idempotent (rolling back to the current version is a no-op),
 emits `vector.tile.version.rolled_back`, and appends a `ROLLBACK` audit
 record with actor + reason.
 
+## DLQ and replay walkthrough (Sequence 3)
+
+Failed jobs are classified (transient vs. permanent), dead-lettered with full
+context, and quarantined with remediation guidance — see
+[`RECOVERY.md`](RECOVERY.md) for the full classification matrix.
+
+```bash
+# Inspect the dead-letter queue
+make dlq DLQ_TENANT=tenant-acme
+
+# Read a quarantined failure report (errorClass, replayEligible, remediation)
+cat data/quarantine/tenant-acme/<jobId>/error-report.json
+
+# Replay a recoverable job (audit fields required)
+make replay-job TENANT=tenant-acme JOB_ID=<jobId> \
+  REASON="Transient Fargate timeout" [ASSUME_WGS84=1]
+
+# Or via the ops API (returns REPLAY_ACCEPTED / REPLAY_NO_OP):
+curl -s -X POST localhost:8080/api/v1/ops/jobs/<jobId>/replay \
+  -H 'Content-Type: application/json' \
+  -d '{"reason":"Retry after increasing Fargate memory","requestedBy":"sre-user"}'
+```
+
+Permanent validation failures (e.g. `MISSING_SHAPEFILE_COMPONENTS`) are
+blocked from replay with `REPLAY_NOT_ALLOWED` — fix the source and submit a
+new upload. `UNKNOWN_CRS` replays with `ASSUME_WGS84=1` (the TRD §10 user
+confirmation). Successful replays clear the DLQ entry; failures return to it.
+
 ## CLI reference (`vtile`)
 
 The same binary is the Fargate entrypoint in production (TRD §11 Decision 2).
@@ -214,6 +243,7 @@ vtile replay --data-dir ./data --tenant tenant-acme --job-id job_... \
     [--assume-wgs84] [--requested-by NAME] [--reason TEXT] [--create-new-version]
 vtile rollback --data-dir ./data --tenant tenant-acme --layer us-parcels-fx \
     --target-version <version> --reason "..." [--requested-by NAME]
+vtile dlq list --data-dir ./data [--tenant tenant-acme]
 ```
 
 `--normalize-only` stops after the normalization artifact (states 1–7) and
@@ -269,6 +299,10 @@ snapshot (Sequence 1 US-06); `make metrics` wraps it.
   conditional promotion, rollback, and the audit trail run against the
   filesystem with the same semantics as the S3 + DynamoDB production design
   (`docs/PUBLISHING.md`).
+- **DLQ/replay semantics are real.** Retry classification, dead-letter
+  capture, quarantine enrichment, eligibility/limit enforcement, and replay
+  audit all run locally; SQS redrive + EventBridge alerting are the
+  production transports (`docs/RECOVERY.md`).
 - **No real queue.** The PUT handler starts processing in-process; the TRD
   "job start < 30 s" NFR is trivially met locally.
 - **File stores instead of DynamoDB.** Single-file catalog (`catalog.json`) —

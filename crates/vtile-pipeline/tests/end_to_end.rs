@@ -21,8 +21,9 @@ use vtile_ingest::shapefile::write::sample_parcel_bundle;
 use vtile_pipeline::events::{EventEmitter, NullEventEmitter, PipelineEvent};
 use vtile_pipeline::job::{job_paths_for, run_job, JobDeps, JobPaths, RunJobInput};
 use vtile_pipeline::quarantine::{FileQuarantineStore, INPUT_FILE_NAME, REPORT_FILE_NAME};
+use vtile_pipeline::recovery::FileDlqStore;
 use vtile_pipeline::store::{FileJobStore, FileLayerCatalog, JobStore, LayerCatalog};
-use vtile_pipeline::{replay_job, ReplayOptions, TileManifest};
+use vtile_pipeline::{replay_job, ReplayOptions, ReplayOutcome, TileManifest};
 
 const TENANT: &str = "tenant-acme";
 const LAYER: &str = "us-parcels-nyc";
@@ -74,6 +75,8 @@ fn parcel_job(job_id: &str) -> JobRecord {
         error: None,
         error_code: None,
         failed_stage: None,
+        error_class: None,
+        replay_eligible: false,
         idempotency_key: None,
         request_fingerprint: None,
         event_dedupe_fingerprint: None,
@@ -84,6 +87,7 @@ fn parcel_job(job_id: &str) -> JobRecord {
         duplicate_event_count: 0,
         requested_tile_version: None,
         replay_audit: None,
+        replay_count: 0,
         outcome: None,
         layer_input: Some(LayerMetadataInput {
             name: Some("NYC Parcels".to_string()),
@@ -118,6 +122,7 @@ fn deps(root: &Path) -> JobDeps {
         catalog: Arc::new(FileLayerCatalog::new(root.join("catalog.json")).unwrap()),
         events: Arc::new(NullEventEmitter),
         quarantine: Some(Arc::new(FileQuarantineStore::new(root.join("quarantine")))),
+        dlq: Some(Arc::new(FileDlqStore::new(root.join("dlq")))),
     }
 }
 
@@ -145,6 +150,7 @@ fn geojson_parcels_end_to_end() {
         catalog: catalog.clone(),
         events: Arc::new(NullEventEmitter),
         quarantine: None,
+        dlq: None,
     };
 
     let job = parcel_job("job_e2e_parcels");
@@ -254,6 +260,7 @@ fn rerunning_completed_job_is_rejected_idempotently() {
         catalog: catalog.clone(),
         events: Arc::new(NullEventEmitter),
         quarantine: None,
+        dlq: None,
     };
 
     let job = parcel_job("job_e2e_idem");
@@ -308,6 +315,7 @@ fn empty_dataset_fails_with_trd_error_code() {
         catalog: catalog.clone(),
         events: emitter.clone(),
         quarantine: None,
+        dlq: None,
     };
 
     let job = parcel_job("job_e2e_empty");
@@ -344,6 +352,7 @@ fn point_assets_end_to_end() {
         catalog: catalog.clone(),
         events: Arc::new(NullEventEmitter),
         quarantine: None,
+        dlq: None,
     };
 
     let mut job = parcel_job("job_e2e_assets");
@@ -480,6 +489,7 @@ fn fixture_invalid_polygon_fails_and_quarantines() {
         catalog: d.catalog.clone(),
         events: emitter.clone(),
         quarantine: d.quarantine.clone(),
+        dlq: d.dlq.clone(),
     };
     let err = run_job(&input, &run_deps).expect_err("invalid polygon must fail");
     assert!(err.to_string().contains("geometry"), "got: {err}");
@@ -616,7 +626,7 @@ fn missing_prj_fails_then_replays_with_assumed_wgs84() {
         .exists());
 
     // 2. Replay with the user's WGS84 confirmation (Recommendation 3 US-03).
-    let outcome = replay_job(
+    let outcome = match replay_job(
         &deps(&root),
         &root,
         TENANT,
@@ -626,7 +636,11 @@ fn missing_prj_fails_then_replays_with_assumed_wgs84() {
             ..Default::default()
         },
     )
-    .expect("replay with assume-wgs84 should succeed");
+    .expect("replay with assume-wgs84 should succeed")
+    {
+        ReplayOutcome::Executed(outcome) => outcome,
+        ReplayOutcome::NoOp { reason } => panic!("expected replay to execute, got no-op: {reason}"),
+    };
     assert_eq!(outcome.feature_count, 3);
 
     let stored = jobs.get(job_id).unwrap().unwrap();
@@ -634,6 +648,8 @@ fn missing_prj_fails_then_replays_with_assumed_wgs84() {
     assert!(stored.error.is_none());
     assert!(stored.error_code.is_none());
     assert!(stored.failed_stage.is_none());
+    // Sequence 3 US-04: the replay attempt is counted.
+    assert_eq!(stored.replay_count, 1);
 
     // Replay published a fresh tile version and swapped the live pointer.
     let latest = TileManifest::from_json(

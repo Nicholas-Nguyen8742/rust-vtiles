@@ -15,9 +15,10 @@ use vtile_ingest::normalize::{CrsPolicy, NormalizeOptions};
 use vtile_ingest::validate::validate_file_type;
 use vtile_pipeline::events::PipelineEvent;
 use vtile_pipeline::job::{
-    new_idempotency_token, new_job_id, new_tile_version, run_job, source_hash, JobPaths,
-    RunJobInput,
+    new_idempotency_token, new_job_id, new_tile_version, run_job_with_retries, source_hash,
+    JobPaths, RunJobInput,
 };
+use vtile_pipeline::recovery::{FileDlqStore, RetryPolicy};
 use vtile_pipeline::{
     classify_ingest_event, event_dedupe_fingerprint, processing_profile_label,
     request_fingerprint, upload_idempotency_key, DedupeRecord, EventDecision, FileDedupeStore,
@@ -141,6 +142,8 @@ pub async fn create_upload(
         error: None,
         error_code: None,
         failed_stage: None,
+        error_class: None,
+        replay_eligible: false,
         idempotency_key: Some(idempotency_key.clone()),
         request_fingerprint: Some(payload_fingerprint.clone()),
         event_dedupe_fingerprint: None,
@@ -151,6 +154,7 @@ pub async fn create_upload(
         duplicate_event_count: 0,
         requested_tile_version: Some(new_tile_version()),
         replay_audit: None,
+        replay_count: 0,
         outcome: None,
         layer_input,
     };
@@ -398,6 +402,8 @@ pub async fn upload_content(
         quarantine: Some(Arc::new(FileQuarantineStore::new(
             state.data_dir.join("quarantine"),
         ))),
+        // Sequence 3 US-01: dead-letter capture under `dlq/`.
+        dlq: Some(Arc::new(FileDlqStore::new(state.data_dir.join("dlq")))),
     };
     let input = RunJobInput {
         job,
@@ -407,9 +413,12 @@ pub async fn upload_content(
         paths,
     };
 
-    // Process off the request path; TRD §14 job start < 30 s.
+    // Process off the request path; TRD §14 job start < 30 s. Transient
+    // failures retry with backoff; exhausted/permanent failures are
+    // dead-lettered (Sequence 3 US-01).
+    let policy = RetryPolicy::default();
     tokio::task::spawn_blocking(move || {
-        if let Err(err) = run_job(&input, &deps) {
+        if let Err(err) = run_job_with_retries(&input, &deps, &policy) {
             tracing::error!(job_id = %input.job.job_id, error = %err, "job failed");
         }
     });
