@@ -6,6 +6,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use chrono::Utc;
 use tracing::{info, instrument};
@@ -24,15 +25,18 @@ use vtile_ingest::normalize::{
 use crate::error::{PipelineError, PipelineResult};
 use crate::events::{EventEmitter, PipelineEvent};
 use crate::manifest::TileManifest;
+use crate::obs::{self, metric, stage as obs_stage};
 use crate::publish::{self, CandidateManifest};
 use crate::quarantine::{ErrorReport, QuarantineStore};
-use crate::recovery::{DlqStore, RecoveryMetric, RecoveryMetrics};
+use crate::recovery::{DlqStore, ErrorClass, RecoveryMetric, RecoveryMetrics};
 use crate::sink_local::LocalTileSink;
 use crate::store::{JobStore, LayerCatalog};
 
 /// Filesystem layout roots for one job (mirrors TRD §6 S3 prefixes).
 #[derive(Debug, Clone)]
 pub struct JobPaths {
+    /// Local data root (`data/`) — audit trail and DLQ live underneath.
+    pub data_dir: PathBuf,
     /// `staging/{tenantId}/{jobId}/`
     pub staging_root: PathBuf,
     /// `tiles/{tenantId}/{layerId}/`
@@ -66,6 +70,7 @@ impl JobPaths {
 /// Standard local layout for one job (mirrors the TRD §6 S3 prefixes).
 pub fn job_paths_for(data_dir: &Path, tenant_id: &str, job_id: &str, layer_id: &str) -> JobPaths {
     JobPaths {
+        data_dir: data_dir.to_path_buf(),
         staging_root: data_dir.join("staging").join(tenant_id).join(job_id),
         tiles_root: data_dir.join("tiles").join(tenant_id).join(layer_id),
         manifests_root: data_dir.join("manifests").join(tenant_id).join(layer_id),
@@ -148,11 +153,60 @@ pub fn run_job(input: &RunJobInput, deps: &JobDeps) -> PipelineResult<JobOutcome
     // Sequence 2: the candidate version is minted up front so publish
     // failures can be reported against it.
     let tile_version = new_tile_version();
+
+    // Sequence 4 US-OBS-02: job lifecycle telemetry. Dimensions are bounded
+    // (environment, tenant, format, category) — never raw file names.
+    let run_started = Instant::now();
+    let environment = obs::environment();
+    let category = obs::category_label(job.layer_input.as_ref().and_then(|m| m.category));
+    let format_label = job.source_format.as_str();
+    let dims: [(&str, &str); 4] = [
+        ("environment", environment.as_str()),
+        ("tenantId", job.tenant_id.as_str()),
+        ("sourceFormat", format_label),
+        ("layerCategory", category.as_str()),
+    ];
+    obs::ObsMetrics::global().inc(metric::INGEST_JOBS_STARTED, &dims);
+
     match run_job_inner(input, deps, &mut stage, &lease.lease_token, &tile_version) {
-        Ok(outcome) => Ok(outcome),
+        Ok(outcome) => {
+            // Sequence 4 US-OBS-02: success telemetry.
+            let elapsed_ms = run_started.elapsed().as_millis() as u64;
+            let metrics = obs::ObsMetrics::global();
+            metrics.inc(metric::INGEST_JOBS_COMPLETED, &dims);
+            metrics.observe(
+                metric::INGEST_JOB_DURATION_SECONDS,
+                elapsed_ms as f64 / 1000.0,
+                &dims,
+            );
+            Ok(outcome)
+        }
         Err(err) => {
             let (code, message) = error_classification(&err);
             let failed_stage = stage.as_str().to_string();
+
+            // Sequence 4 US-OBS-02: failure telemetry (rate by error code).
+            let mut failed_dims: Vec<(&str, &str)> = dims.to_vec();
+            failed_dims.push(("errorCode", code.as_str()));
+            obs::ObsMetrics::global().inc(metric::INGEST_JOBS_FAILED, &failed_dims);
+            if crate::recovery::classify_code(&code) == ErrorClass::PermanentValidation {
+                obs::ObsMetrics::global()
+                    .inc(metric::INGEST_VALIDATION_FAILURES, &failed_dims);
+            }
+            let mut failed_log = obs::StageLog::new(
+                obs::SERVICE_PROCESSOR,
+                obs_stage::JOB_FAILED,
+                &job.tenant_id,
+                &job.job_id,
+                &job.layer_id,
+            );
+            failed_log.stage = Some(failed_stage.clone());
+            failed_log.status = Some("FAILED".to_string());
+            failed_log.error_code = Some(code.clone());
+            failed_log.source_format = Some(job.source_format.as_str().to_string());
+            failed_log.duration_ms = Some(run_started.elapsed().as_millis() as u64);
+            failed_log.trace_id = job.trace_id.clone();
+            obs::emit_stage_log(&failed_log);
 
             // Sequence 2 US-AP-06: publish-stage failures get dedicated
             // telemetry; the previous published version stays active.
@@ -263,15 +317,26 @@ fn run_job_inner(
 
     // ── 1. Validate upload ────────────────────────────────────────────────
     advance_stage(deps, &job.job_id, lease_token, stage, JobStatus::Validating)?;
+    obs::emit_stage_log(&obs_stage_log(job, obs_stage::VALIDATION_STARTED, "VALIDATING"));
+    let validation_started = Instant::now();
     if !job.source_format.is_supported_in_mvp() {
         return Err(PipelineError::Job(format!(
             "source format {:?} not supported in MVP",
             job.source_format
         )));
     }
+    let mut validation_log = obs_stage_log(job, obs_stage::VALIDATION_COMPLETED, "VALIDATING");
+    validation_log.duration_ms = Some(validation_started.elapsed().as_millis() as u64);
+    obs::emit_stage_log(&validation_log);
 
     // ── 2–7. Detect format → unpack → CRS/geometry validation → normalize ─
     advance_stage(deps, &job.job_id, lease_token, stage, JobStatus::Normalizing)?;
+    obs::emit_stage_log(&obs_stage_log(
+        job,
+        obs_stage::NORMALIZATION_STARTED,
+        "NORMALIZING",
+    ));
+    let normalization_started = Instant::now();
     let source = match job.source_format {
         vtile_core::model::SourceFormat::GeoJson => SourceFile::GeoJson {
             bytes: input.source_bytes.clone(),
@@ -289,6 +354,12 @@ fn run_job_inner(
         crs = dataset.crs.label(),
         "normalization complete"
     );
+    let mut normalization_log =
+        obs_stage_log(job, obs_stage::NORMALIZATION_COMPLETED, "NORMALIZING");
+    normalization_log.crs = Some(dataset.crs.label().to_string());
+    normalization_log.feature_count = Some(dataset.feature_count() as u64);
+    normalization_log.duration_ms = Some(normalization_started.elapsed().as_millis() as u64);
+    obs::emit_stage_log(&normalization_log);
 
     // ── 5. Write normalized artifact ──────────────────────────────────────
     fs::create_dir_all(&paths.staging_root)?;
@@ -301,6 +372,7 @@ fn run_job_inner(
 
     // ── 8. Generate vector tiles ──────────────────────────────────────────
     advance_stage(deps, &job.job_id, lease_token, stage, JobStatus::Tiling)?;
+    obs::emit_stage_log(&obs_stage_log(job, obs_stage::TILE_GENERATION_STARTED, "TILING"));
     let raw_features: Vec<RawFeature> = dataset
         .features
         .iter()
@@ -336,8 +408,39 @@ fn run_job_inner(
         "tile generation complete"
     );
 
+    // Sequence 4 US-OBS-02/06: generation telemetry (bounded dimensions).
+    let environment = obs::environment();
+    let category_label = obs::category_label(job.layer_input.as_ref().and_then(|m| m.category));
+    let gen_dims: [(&str, &str); 3] = [
+        ("environment", environment.as_str()),
+        ("tenantId", job.tenant_id.as_str()),
+        ("layerCategory", category_label.as_str()),
+    ];
+    let metrics = obs::ObsMetrics::global();
+    metrics.add(
+        metric::GEOSPATIAL_FEATURES_PROCESSED,
+        prepared.feature_count(),
+        &gen_dims,
+    );
+    metrics.add(metric::GEOSPATIAL_TILES_PUBLISHED, stats.tiles_written, &gen_dims);
+    metrics.add(metric::GEOSPATIAL_OUTPUT_BYTES, stats.total_gzip_bytes, &gen_dims);
+    if stats.max_gzip_bytes > 0 {
+        metrics.observe(
+            metric::GEOSPATIAL_TILE_SIZE_BYTES,
+            stats.max_gzip_bytes as f64,
+            &gen_dims,
+        );
+    }
+    let mut tiling_log = obs_stage_log(job, obs_stage::TILE_GENERATION_COMPLETED, "TILING");
+    tiling_log.feature_count = Some(prepared.feature_count());
+    tiling_log.tile_count = Some(stats.tiles_written);
+    tiling_log.duration_ms = Some(stats.elapsed_ms);
+    obs::emit_stage_log(&tiling_log);
+
     // ── 9/10. Atomic publish (Sequence 2): candidate → validate → promote ─
     advance_stage(deps, &job.job_id, lease_token, stage, JobStatus::Publishing)?;
+    obs::emit_stage_log(&obs_stage_log(job, obs_stage::PUBLISH_STARTED, "PUBLISHING"));
+    let publish_started = Instant::now();
 
     // US-AP-01/02: the candidate manifest records completeness + integrity
     // before the version can become visible.
@@ -386,6 +489,32 @@ fn run_job_inner(
         previous = ?expected_previous,
         "layer version promoted atomically"
     );
+
+    // Sequence 4 US-OBS-02/06: publish telemetry + central audit record.
+    let publish_ms = publish_started.elapsed().as_millis() as u64;
+    metrics.observe(
+        metric::LAYER_PUBLISH_DURATION,
+        publish_ms as f64 / 1000.0,
+        &gen_dims,
+    );
+    metrics.inc(metric::LAYERS_PUBLISHED, &gen_dims);
+    metrics.observe(metric::LAYER_MAX_TILE_SIZE, stats.max_gzip_bytes as f64, &gen_dims);
+    let mut publish_log = obs_stage_log(job, obs_stage::PUBLISH_COMPLETED, "PUBLISHING");
+    publish_log.tile_count = Some(stats.tiles_written);
+    publish_log.duration_ms = Some(publish_ms);
+    obs::emit_stage_log(&publish_log);
+    let _ = obs::FileAuditTrail::new(&paths.data_dir).append(&obs::AuditRecord {
+        event_type: obs::audit_event::LAYER_PUBLISHED.to_string(),
+        event_id: new_event_id(),
+        tenant_id: job.tenant_id.clone(),
+        layer_id: Some(job.layer_id.clone()),
+        job_id: Some(job.job_id.clone()),
+        tile_version: Some(tile_version.clone()),
+        actor: Some(publish::PIPELINE_ACTOR.to_string()),
+        reason: None,
+        succeeded: true,
+        occurred_at: Utc::now(),
+    });
 
     // ── 11. Update catalog ────────────────────────────────────────────────
     let layer_input = job.layer_input.clone().unwrap_or_default();
@@ -479,6 +608,24 @@ fn advance_stage(
         .transition(job_id, Some(lease_token), *stage, next)?;
     *stage = next;
     Ok(())
+}
+
+/// Builds a stage log with the job's correlation fields (Sequence 4
+/// US-OBS-01): service, environment, tenant/job/layer, source format, and
+/// the trace/span ids linking logs to the job's end-to-end trace.
+fn obs_stage_log(job: &JobRecord, event: &str, stage: &str) -> obs::StageLog {
+    let mut log = obs::StageLog::new(
+        obs::SERVICE_PROCESSOR,
+        event,
+        &job.tenant_id,
+        &job.job_id,
+        &job.layer_id,
+    );
+    log.stage = Some(stage.to_string());
+    log.source_format = Some(job.source_format.as_str().to_string());
+    log.trace_id = job.trace_id.clone();
+    log.span_id = Some(obs::new_span_id());
+    log
 }
 
 /// Maps errors onto the TRD error-code vocabulary used in `job.failed`

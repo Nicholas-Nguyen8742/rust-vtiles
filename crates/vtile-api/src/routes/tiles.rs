@@ -35,6 +35,7 @@ use axum::response::{IntoResponse, Response};
 
 use vtile_core::model::LayerMetadata;
 use vtile_pipeline::manifest::TileManifest;
+use vtile_pipeline::obs::{self, metric};
 use vtile_pipeline::publish::{version_root, FileLayerRegistry};
 
 use crate::auth;
@@ -80,6 +81,13 @@ fn resolve_request(
     //    pinned to their own tenant prefix.
     if let Some(tenant) = auth::authorized_tenant(state, headers) {
         if tenant != tenant_id {
+            // Sequence 4 US-OBS-05: cross-tenant access is audited and
+            // counted (security-review signal).
+            obs::record_access_denied(
+                &state.data_dir,
+                &tenant,
+                &format!("tiles of layer {layer_id}"),
+            );
             return Err(ApiError::forbidden(format!(
                 "tenant {tenant} cannot access tiles of tenant {tenant_id}"
             )));
@@ -130,12 +138,16 @@ fn resolve_request(
 }
 
 /// Serves one tile from the immutable version path, or `204` for voids.
+/// Supports conditional requests: a matching `If-None-Match` returns `304`
+/// (the local CloudFront analog) and counts as a cache hit (Sequence 4
+/// US-OBS-06).
 async fn serve_tile(
     state: &AppState,
     tenant_id: &str,
     layer_id: &str,
     tile_version: &str,
     coord: &TileCoord,
+    headers: &HeaderMap,
 ) -> Result<Response, ApiError> {
     let tiles_root = state
         .data_dir
@@ -162,11 +174,32 @@ async fn serve_tile(
     } else {
         HeaderValue::from_static("public, max-age=3600")
     };
-    let etag = HeaderValue::from_str(&format!(
+    let etag_str = format!(
         "\"{}/{}/{}/{}\"",
         tile_version, coord.z, coord.x, coord.y
-    ))
-    .map_err(|e| ApiError::internal(format!("invalid etag: {e}")))?;
+    );
+    let etag = HeaderValue::from_str(&etag_str)
+        .map_err(|e| ApiError::internal(format!("invalid etag: {e}")))?;
+
+    let dims: [(&str, &str); 1] = [("tenantId", tenant_id)];
+    let metrics = obs::ObsMetrics::global();
+    if headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        == Some(etag_str.as_str())
+    {
+        metrics.inc(metric::TILE_CACHE_HITS, &dims);
+        return Ok((
+            StatusCode::NOT_MODIFIED,
+            [
+                (header::CACHE_CONTROL, cache_control),
+                (header::ETAG, etag),
+            ],
+        )
+            .into_response());
+    }
+    metrics.inc(metric::TILE_CACHE_MISSES, &dims);
+    metrics.add(metric::TILE_PAYLOAD_BYTES, bytes.len() as u64, &dims);
 
     Ok((
         [
@@ -180,6 +213,52 @@ async fn serve_tile(
         .into_response())
 }
 
+/// Per-request tile delivery telemetry (Sequence 4 US-OBS-06): requests by
+/// status class, latency histogram, 4xx/5xx counters, empty responses.
+fn record_tile_telemetry(
+    tenant_id: &str,
+    started: std::time::Instant,
+    result: &Result<Response, ApiError>,
+) {
+    let status_class = match result {
+        Ok(resp) => {
+            let s = resp.status();
+            if s == StatusCode::NO_CONTENT {
+                "204"
+            } else if s == StatusCode::NOT_MODIFIED {
+                "304"
+            } else if s.is_success() {
+                "200"
+            } else if s.is_client_error() {
+                "4xx"
+            } else {
+                "5xx"
+            }
+        }
+        Err(e) => {
+            if e.status.is_server_error() {
+                "5xx"
+            } else {
+                "4xx"
+            }
+        }
+    };
+    let dims: [(&str, &str); 2] = [("tenantId", tenant_id), ("status", status_class)];
+    let metrics = obs::ObsMetrics::global();
+    metrics.inc(metric::TILE_REQUESTS, &dims);
+    metrics.observe(
+        metric::TILE_REQUEST_DURATION,
+        started.elapsed().as_secs_f64(),
+        &dims,
+    );
+    match status_class {
+        "204" => metrics.inc(metric::TILE_EMPTY_RESPONSES, &dims),
+        "4xx" => metrics.inc(metric::TILE_4XX, &dims),
+        "5xx" => metrics.inc(metric::TILE_5XX, &dims),
+        _ => {}
+    }
+}
+
 pub async fn get_tile(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -191,8 +270,26 @@ pub async fn get_tile(
         String,
     )>,
 ) -> Result<Response, ApiError> {
-    let (_layer, coord) = resolve_request(
+    let started = std::time::Instant::now();
+    let result = get_tile_impl(
         &state, &headers, &tenant_id, &layer_id, &z_raw, &x_raw, &y_raw,
+    )
+    .await;
+    record_tile_telemetry(&tenant_id, started, &result);
+    result
+}
+
+async fn get_tile_impl(
+    state: &AppState,
+    headers: &HeaderMap,
+    tenant_id: &str,
+    layer_id: &str,
+    z_raw: &str,
+    x_raw: &str,
+    y_raw: &str,
+) -> Result<Response, ApiError> {
+    let (_layer, coord) = resolve_request(
+        state, headers, tenant_id, layer_id, z_raw, x_raw, y_raw,
     )?;
 
     // 4. Resolve the live tile version through the authoritative layer
@@ -201,8 +298,8 @@ pub async fn get_tile(
     let manifests_root = state
         .data_dir
         .join("manifests")
-        .join(&tenant_id)
-        .join(&layer_id);
+        .join(tenant_id)
+        .join(layer_id);
     let tile_version = match FileLayerRegistry::new(&manifests_root).get()? {
         Some(record) => record.current_tile_version,
         None => {
@@ -225,7 +322,7 @@ pub async fn get_tile(
     };
 
     // 5. Serve the tile, or 204 for empty/void tiles.
-    serve_tile(&state, &tenant_id, &layer_id, &tile_version, &coord).await
+    serve_tile(state, tenant_id, layer_id, &tile_version, &coord, headers).await
 }
 
 /// Explicit-version read path (Sequence 2 US-AP-04): serves from the named
@@ -243,8 +340,27 @@ pub async fn get_tile_versioned(
         String,
     )>,
 ) -> Result<Response, ApiError> {
+    let started = std::time::Instant::now();
+    let result = get_tile_versioned_impl(
+        &state, &headers, &tenant_id, &layer_id, &version, &z_raw, &x_raw, &y_raw,
+    )
+    .await;
+    record_tile_telemetry(&tenant_id, started, &result);
+    result
+}
+
+async fn get_tile_versioned_impl(
+    state: &AppState,
+    headers: &HeaderMap,
+    tenant_id: &str,
+    layer_id: &str,
+    version: &str,
+    z_raw: &str,
+    x_raw: &str,
+    y_raw: &str,
+) -> Result<Response, ApiError> {
     let (_layer, coord) = resolve_request(
-        &state, &headers, &tenant_id, &layer_id, &z_raw, &x_raw, &y_raw,
+        state, headers, tenant_id, layer_id, z_raw, x_raw, y_raw,
     )?;
-    serve_tile(&state, &tenant_id, &layer_id, &version, &coord).await
+    serve_tile(state, tenant_id, layer_id, version, &coord, headers).await
 }

@@ -57,6 +57,7 @@ fn base_job(job_id: &str) -> JobRecord {
         error_class: None,
         replay_eligible: false,
         idempotency_key: None,
+        trace_id: None,
         request_fingerprint: None,
         event_dedupe_fingerprint: None,
         state_version: 1,
@@ -161,6 +162,9 @@ impl JobStore for FailingJobStore {
     }
     fn get(&self, job_id: &str) -> vtile_pipeline::PipelineResult<Option<JobRecord>> {
         self.inner.get(job_id)
+    }
+    fn list(&self) -> vtile_pipeline::PipelineResult<Vec<JobRecord>> {
+        self.inner.list()
     }
     fn find_by_idempotency_key(
         &self,

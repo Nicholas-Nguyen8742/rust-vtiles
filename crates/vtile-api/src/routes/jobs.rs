@@ -27,6 +27,12 @@ pub async fn get_job(
     // only observe jobs belonging to their own tenant.
     if let Some(tenant) = auth::authorized_tenant(&state, &headers) {
         if tenant != job.tenant_id {
+            // Sequence 4 US-OBS-05: cross-tenant access is audited.
+            vtile_pipeline::record_access_denied(
+                &state.data_dir,
+                &tenant,
+                &format!("job {job_id}"),
+            );
             return Err(ApiError::forbidden(format!(
                 "tenant {tenant} cannot access job {job_id}"
             )));

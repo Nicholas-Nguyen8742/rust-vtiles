@@ -151,3 +151,14 @@ pub struct ReplayJobResponse {
 pub struct DlqListQuery {
     pub tenant_id: Option<String>,
 }
+
+/// `GET /api/v1/ops/audit` query parameters (Sequence 4 US-OBS-05). All
+/// filters are optional; results are newest-first and capped at `limit`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditQuery {
+    pub tenant_id: Option<String>,
+    pub layer_id: Option<String>,
+    pub event_type: Option<String>,
+    pub limit: Option<usize>,
+}

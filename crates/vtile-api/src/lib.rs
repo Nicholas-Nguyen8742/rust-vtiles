@@ -10,7 +10,10 @@
 //!   (Sequence 2 US-AP-05)
 //! * `POST /api/v1/ops/jobs/:job_id/replay` — authorized idempotent replay
 //!   (Sequence 3 US-04), `GET /api/v1/ops/dlq` — dead-letter inspection
-//!   (Sequence 3 US-06)
+//!   (Sequence 3 US-06), `GET /api/v1/ops/audit` — tenant-scoped audit trail
+//!   (Sequence 4 US-OBS-05)
+//! * `GET /internal/dashboard`, `GET /internal/alerts` — operations
+//!   dashboard + alert evaluation (Sequence 4 US-OBS-03)
 //! * `GET  /tiles/:tenant/:layer/:z/:x/:y.pbf` (§8.5),
 //!   `GET /tiles/:tenant/:layer/versions/:version/:z/:x/:y.pbf` (Sequence 2
 //!   US-AP-04 explicit-version read path)
@@ -48,6 +51,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/healthz", get(routes::health::healthz))
         .route("/internal/metrics", get(routes::health::metrics))
+        .route("/internal/dashboard", get(routes::health::dashboard))
+        .route("/internal/alerts", get(routes::health::alerts))
         .route("/api/v1/ingest/uploads", post(routes::uploads::create_upload))
         .route(
             "/api/v1/ingest/uploads/:job_id/content",
@@ -68,6 +73,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             post(routes::ops::replay_job),
         )
         .route("/api/v1/ops/dlq", get(routes::ops::list_dlq))
+        .route("/api/v1/ops/audit", get(routes::ops::query_audit))
         .route(
             "/tiles/:tenant/:layer/:z/:x/:y",
             get(routes::tiles::get_tile),

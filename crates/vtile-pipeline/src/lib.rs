@@ -18,6 +18,7 @@ pub mod events;
 pub mod idempotency;
 pub mod job;
 pub mod manifest;
+pub mod obs;
 pub mod publish;
 pub mod quarantine;
 pub mod recovery;
@@ -35,6 +36,12 @@ pub use idempotency::{
 };
 pub use job::{new_replay_id, run_job, JobDeps, RunJobInput};
 pub use manifest::TileManifest;
+pub use obs::{
+    alert_rules, build_dashboard, category_label, dlq_depth, emit_stage_log, evaluate_alerts,
+    layer_health, merged_metrics_snapshot, new_span_id, new_trace_id, record_access_denied,
+    AlertCondition, AlertRule, AlertSeverity, AlertState, AuditRecord, FileAuditTrail,
+    LayerHealth, ObsMetrics, StageLog, SERVICE_API, SERVICE_PROCESSOR,
+};
 pub use publish::{
     aggregate_checksum, promote_layer_version, read_candidate_manifest, rollback_layer_version,
     tile_url_template_for, verify_candidate, write_candidate_manifest, AuditAction,

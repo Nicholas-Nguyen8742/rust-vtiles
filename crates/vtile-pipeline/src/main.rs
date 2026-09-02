@@ -348,6 +348,7 @@ fn run(
             &new_idempotency_token(),
             &processing_profile_label(category, zoom_range),
         )),
+        trace_id: Some(vtile_pipeline::new_trace_id()),
         request_fingerprint: None,
         event_dedupe_fingerprint: None,
         state_version: 1,

@@ -38,6 +38,8 @@ pub trait JobStore: Send + Sync {
     /// Replaces the full record (used when the outcome summary is attached).
     fn upsert(&self, job: JobRecord) -> PipelineResult<()>;
     fn get(&self, job_id: &str) -> PipelineResult<Option<JobRecord>>;
+    /// All job records, newest first (dashboard/ops support, Sequence 4).
+    fn list(&self) -> PipelineResult<Vec<JobRecord>>;
 
     /// Resolves the job registered under an upload idempotency key
     /// (Sequence 1 US-01). File scan locally; a DynamoDB GSI in production.
@@ -148,6 +150,27 @@ impl JobStore for FileJobStore {
         }
         let json = fs::read_to_string(path)?;
         Ok(Some(serde_json::from_str(&json)?))
+    }
+
+    fn list(&self) -> PipelineResult<Vec<JobRecord>> {
+        let mut out = Vec::new();
+        let Ok(entries) = fs::read_dir(&self.dir) else {
+            return Ok(out);
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(json) = fs::read_to_string(&path) else {
+                continue;
+            };
+            if let Ok(job) = serde_json::from_str::<JobRecord>(&json) {
+                out.push(job);
+            }
+        }
+        out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        Ok(out)
     }
 
     fn find_by_idempotency_key(

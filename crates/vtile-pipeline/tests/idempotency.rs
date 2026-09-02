@@ -57,6 +57,7 @@ fn base_job(job_id: &str) -> JobRecord {
         error_class: None,
         replay_eligible: false,
         idempotency_key: None,
+        trace_id: None,
         request_fingerprint: None,
         event_dedupe_fingerprint: None,
         state_version: 1,

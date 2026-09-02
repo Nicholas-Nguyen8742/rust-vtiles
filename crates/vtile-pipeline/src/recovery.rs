@@ -26,6 +26,7 @@ use vtile_core::model::JobStatus;
 use crate::error::{PipelineError, PipelineResult};
 use crate::events::PipelineEvent;
 use crate::job::{error_classification, new_event_id, run_job, JobDeps, JobOutcome, RunJobInput};
+use crate::obs::{self, metric, stage as obs_stage};
 
 // ── Error classification (US-03) ────────────────────────────────────────────
 
@@ -398,6 +399,25 @@ pub fn run_job_with_retries(
                         error_code = %code,
                         "transient failure; retry scheduled"
                     );
+                    // Sequence 4 US-OBS-01/02: retry stage log + metric.
+                    obs::ObsMetrics::global().inc(
+                        metric::INGEST_RETRY,
+                        &[
+                            ("tenantId", input.job.tenant_id.as_str()),
+                            ("errorCode", code.as_str()),
+                        ],
+                    );
+                    let mut retry_log = obs::StageLog::new(
+                        obs::SERVICE_PROCESSOR,
+                        obs_stage::JOB_RETRIED,
+                        &input.job.tenant_id,
+                        &input.job.job_id,
+                        &input.job.layer_id,
+                    );
+                    retry_log.status = Some("RETRYING".to_string());
+                    retry_log.error_code = Some(code.clone());
+                    retry_log.trace_id = input.job.trace_id.clone();
+                    obs::emit_stage_log(&retry_log);
                     if delay_secs > 0 {
                         std::thread::sleep(std::time::Duration::from_secs(delay_secs));
                     }
@@ -459,6 +479,26 @@ pub fn dead_letter_failure(deps: &JobDeps, job_id: &str, err: &PipelineError, re
                 dlq = %path.display(),
                 "job dead-lettered"
             );
+            // Sequence 4 US-OBS-01/02: DLQ stage log + metric.
+            obs::ObsMetrics::global().inc(
+                metric::INGEST_DLQ_MESSAGES,
+                &[
+                    ("tenantId", record.tenant_id.as_str()),
+                    ("errorCode", record.error_code.as_str()),
+                ],
+            );
+            let mut dlq_log = obs::StageLog::new(
+                obs::SERVICE_PROCESSOR,
+                obs_stage::JOB_SENT_TO_DLQ,
+                &record.tenant_id,
+                &record.job_id,
+                &record.layer_id,
+            );
+            dlq_log.stage = Some(record.failed_stage.clone());
+            dlq_log.status = Some("DEAD_LETTERED".to_string());
+            dlq_log.error_code = Some(record.error_code.clone());
+            dlq_log.trace_id = job.trace_id.clone();
+            obs::emit_stage_log(&dlq_log);
         }
         Err(de) => tracing::error!(
             job_id = %job_id,

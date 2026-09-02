@@ -55,6 +55,7 @@ fn temp_root(label: &str) -> PathBuf {
 
 fn job_paths(root: &Path) -> JobPaths {
     JobPaths {
+        data_dir: root.to_path_buf(),
         staging_root: root.join("staging").join(TENANT).join("job_test"),
         tiles_root: root.join("tiles").join(TENANT).join(LAYER),
         manifests_root: root.join("manifests").join(TENANT).join(LAYER),
@@ -78,6 +79,7 @@ fn parcel_job(job_id: &str) -> JobRecord {
         error_class: None,
         replay_eligible: false,
         idempotency_key: None,
+        trace_id: None,
         request_fingerprint: None,
         event_dedupe_fingerprint: None,
         state_version: 1,
@@ -366,6 +368,7 @@ fn point_assets_end_to_end() {
     jobs.create(job.clone()).unwrap();
 
     let paths = JobPaths {
+        data_dir: root.to_path_buf(),
         staging_root: root.join("staging").join(TENANT).join("job_assets"),
         tiles_root: root.join("tiles").join(TENANT).join("us-assets-nyc"),
         manifests_root: root.join("manifests").join(TENANT).join("us-assets-nyc"),

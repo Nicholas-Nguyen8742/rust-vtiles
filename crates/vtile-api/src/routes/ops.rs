@@ -9,6 +9,7 @@ use axum::Json;
 use chrono::Utc;
 
 use vtile_core::model::JobStatus;
+use vtile_pipeline::obs::{self, metric};
 use vtile_pipeline::publish::{rollback_layer_version, LayerVersionRecord};
 use vtile_pipeline::recovery::{FileDlqStore, DlqRecord, DlqStore, MAX_MANUAL_REPLAYS};
 use vtile_pipeline::{
@@ -17,7 +18,7 @@ use vtile_pipeline::{
 };
 
 use crate::auth;
-use crate::dto::{DlqListQuery, ReplayJobRequest, ReplayJobResponse, RollbackRequest};
+use crate::dto::{AuditQuery, DlqListQuery, ReplayJobRequest, ReplayJobResponse, RollbackRequest};
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -137,6 +138,8 @@ pub async fn replay_job(
     // Tenant isolation (TRD §13): callers may only replay their own jobs.
     if let Some(tenant) = auth::authorized_tenant(&state, &headers) {
         if tenant != job.tenant_id {
+            // Sequence 4 US-OBS-05: cross-tenant replay attempts are audited.
+            obs::record_access_denied(&state.data_dir, &tenant, &format!("job {job_id}"));
             return Err(ApiError::forbidden(format!(
                 "tenant {tenant} cannot replay job {job_id}"
             )));
@@ -220,6 +223,24 @@ pub async fn replay_job(
     let tenant_id = job.tenant_id.clone();
     let replay_job_id = job.job_id.clone();
 
+    // Sequence 4 US-OBS-05: replay audit trail + tenant-isolation metrics.
+    obs::ObsMetrics::global().inc(
+        metric::REPLAY_OPERATIONS,
+        &[("tenantId", tenant_id.as_str())],
+    );
+    let _ = obs::FileAuditTrail::new(&state.data_dir).append(&obs::AuditRecord {
+        event_type: obs::audit_event::JOB_REPLAYED.to_string(),
+        event_id: vtile_pipeline::job::new_event_id(),
+        tenant_id: tenant_id.clone(),
+        layer_id: Some(job.layer_id.clone()),
+        job_id: Some(replay_job_id.clone()),
+        tile_version: None,
+        actor: Some(requested_by.clone()),
+        reason: Some(reason.clone()),
+        succeeded: true,
+        occurred_at: chrono::Utc::now(),
+    });
+
     let deps = JobDeps {
         jobs: state.jobs.clone(),
         catalog: state.catalog.clone(),
@@ -294,5 +315,25 @@ pub async fn list_dlq(
             all
         }
     };
+    Ok(Json(records))
+}
+
+/// `GET /api/v1/ops/audit` — tenant-scoped audit trail query (Sequence 4
+/// US-OBS-05). With token auth enabled the caller is pinned to their own
+/// tenant regardless of the query string (TRD §13), so one tenant can never
+/// read another's audit history.
+pub async fn query_audit(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<AuditQuery>,
+) -> Result<Json<Vec<obs::AuditRecord>>, ApiError> {
+    let tenant = auth::authorized_tenant(&state, &headers).or(q.tenant_id);
+    let trail = obs::FileAuditTrail::new(&state.data_dir);
+    let records = trail.query(
+        tenant.as_deref(),
+        q.layer_id.as_deref(),
+        q.event_type.as_deref(),
+        q.limit.unwrap_or(200),
+    )?;
     Ok(Json(records))
 }

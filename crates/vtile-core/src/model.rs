@@ -267,6 +267,10 @@ pub struct JobRecord {
     /// creating a new one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
+    /// Sequence 4 US-OBS-01/04: W3C-shaped trace id created at upload time
+    /// and propagated through every stage log for the job's lifetime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
     /// Sequence 1 US-02: fingerprint of the upload request payload, used to
     /// detect a reused idempotency key with a *different* payload
     /// (`IDEMPOTENCY_KEY_PAYLOAD_MISMATCH`).

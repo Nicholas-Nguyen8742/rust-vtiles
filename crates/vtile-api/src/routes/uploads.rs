@@ -18,6 +18,7 @@ use vtile_pipeline::job::{
     new_idempotency_token, new_job_id, new_tile_version, run_job_with_retries, source_hash,
     JobPaths, RunJobInput,
 };
+use vtile_pipeline::obs::{self, metric, stage as obs_stage};
 use vtile_pipeline::recovery::{FileDlqStore, RetryPolicy};
 use vtile_pipeline::{
     classify_ingest_event, event_dedupe_fingerprint, processing_profile_label,
@@ -145,6 +146,7 @@ pub async fn create_upload(
         error_class: None,
         replay_eligible: false,
         idempotency_key: Some(idempotency_key.clone()),
+        trace_id: Some(obs::new_trace_id()),
         request_fingerprint: Some(payload_fingerprint.clone()),
         event_dedupe_fingerprint: None,
         state_version: 1,
@@ -178,6 +180,37 @@ pub async fn create_upload(
         }
         Err(e) => return Err(e.into()),
     }
+
+    // Sequence 4 US-OBS-01/02/05: upload telemetry + audit trail.
+    obs::ObsMetrics::global().inc(
+        metric::INGEST_UPLOADS_REQUESTED,
+        &[
+            ("tenantId", req.tenant_id.as_str()),
+            ("sourceFormat", req.source_format.as_str()),
+        ],
+    );
+    let mut requested_log = obs::StageLog::new(
+        obs::SERVICE_API,
+        obs_stage::UPLOAD_REQUESTED,
+        &req.tenant_id,
+        &job_id,
+        &req.layer_id,
+    );
+    requested_log.source_format = Some(req.source_format.as_str().to_string());
+    requested_log.trace_id = job.trace_id.clone();
+    obs::emit_stage_log(&requested_log);
+    let _ = obs::FileAuditTrail::new(&state.data_dir).append(&obs::AuditRecord {
+        event_type: obs::audit_event::UPLOAD_INITIATED.to_string(),
+        event_id: vtile_pipeline::job::new_event_id(),
+        tenant_id: req.tenant_id.clone(),
+        layer_id: Some(req.layer_id.clone()),
+        job_id: Some(job_id.clone()),
+        tile_version: None,
+        actor: None,
+        reason: None,
+        succeeded: true,
+        occurred_at: Utc::now(),
+    });
 
     tracing::info!(
         job_id = %job_id,
@@ -362,6 +395,47 @@ pub async fn upload_content(
         occurred_at: Utc::now(),
     });
 
+    // Sequence 4 US-OBS-01/02/05: completion telemetry + audit trail.
+    let upload_dims: [(&str, &str); 2] = [
+        ("tenantId", job.tenant_id.as_str()),
+        ("sourceFormat", job.source_format.as_str()),
+    ];
+    let obs_metrics = obs::ObsMetrics::global();
+    obs_metrics.inc(metric::INGEST_UPLOADS_COMPLETED, &upload_dims);
+    obs_metrics.inc(metric::INGEST_JOBS_SUBMITTED, &upload_dims);
+    let mut completed_log = obs::StageLog::new(
+        obs::SERVICE_API,
+        obs_stage::UPLOAD_COMPLETED,
+        &job.tenant_id,
+        &job.job_id,
+        &job.layer_id,
+    );
+    completed_log.file_bytes = Some(size);
+    completed_log.source_format = Some(job.source_format.as_str().to_string());
+    completed_log.trace_id = job.trace_id.clone();
+    obs::emit_stage_log(&completed_log);
+    let mut submitted_log = obs::StageLog::new(
+        obs::SERVICE_API,
+        obs_stage::JOB_SUBMITTED,
+        &job.tenant_id,
+        &job.job_id,
+        &job.layer_id,
+    );
+    submitted_log.trace_id = job.trace_id.clone();
+    obs::emit_stage_log(&submitted_log);
+    let _ = obs::FileAuditTrail::new(&state.data_dir).append(&obs::AuditRecord {
+        event_type: obs::audit_event::UPLOAD_COMPLETED.to_string(),
+        event_id: vtile_pipeline::job::new_event_id(),
+        tenant_id: job.tenant_id.clone(),
+        layer_id: Some(job.layer_id.clone()),
+        job_id: Some(job.job_id.clone()),
+        tile_version: None,
+        actor: None,
+        reason: None,
+        succeeded: true,
+        occurred_at: Utc::now(),
+    });
+
     // Assemble the run.
     let category = job.layer_input.as_ref().and_then(|m| m.category);
     let tile_config = TileConfig {
@@ -376,6 +450,7 @@ pub async fn upload_content(
         ..Default::default()
     };
     let paths = JobPaths {
+        data_dir: state.data_dir.clone(),
         staging_root: state
             .data_dir
             .join("staging")
