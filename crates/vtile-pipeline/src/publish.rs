@@ -557,20 +557,25 @@ pub fn promote_layer_version(
 }
 
 /// Rollback (Sequence 2 US-AP-05): repoint the authoritative layer record —
-/// and the compatibility manifests — to a previously published version. No
+/// and the compatibility manifest — to a previously published version. No
 /// reprocessing occurs. Idempotent: rolling back to the current version is a
-/// no-op returning the existing record.
+/// no-op returning the existing record. Appends a `tile.version.rolled_back`
+/// record to the central audit trail (Sequence 4 US-OBS-05).
 pub fn rollback_layer_version(
     tenant_id: &str,
     layer_id: &str,
-    tiles_root: &Path,
-    manifests_root: &Path,
+    data_dir: &Path,
     target_version: &str,
     reason: &str,
     actor: &str,
     events: &dyn EventEmitter,
 ) -> PipelineResult<LayerVersionRecord> {
-    let registry = FileLayerRegistry::new(manifests_root);
+    let tiles_root = data_dir.join("tiles").join(tenant_id).join(layer_id);
+    let manifests_root = data_dir
+        .join("manifests")
+        .join(tenant_id)
+        .join(layer_id);
+    let registry = FileLayerRegistry::new(&manifests_root);
     let current = registry.get()?.ok_or_else(|| {
         PipelineError::RollbackFailed(format!("layer {layer_id} has no published version"))
     })?;
@@ -580,18 +585,18 @@ pub fn rollback_layer_version(
 
     // The target must be a known-good, retained version: it needs its
     // candidate manifest (the zoom/bbox/checksum source of truth).
-    let target_manifest = read_candidate_manifest(tiles_root, target_version)?
+    let target_manifest = read_candidate_manifest(&tiles_root, target_version)?
         .ok_or_else(|| {
             PipelineError::RollbackFailed(format!(
                 "target version {target_version} not found under {}",
-                version_root(tiles_root, target_version).display()
+                version_root(&tiles_root, target_version).display()
             ))
         })?;
 
     let record = registry.rollback(target_version, reason, actor)?;
-    write_live_pointers(manifests_root, &tile_manifest_from_candidate(&target_manifest))?;
+    write_live_pointers(&manifests_root, &tile_manifest_from_candidate(&target_manifest))?;
 
-    FileAuditLog::new(manifests_root).append(&PublishAuditRecord {
+    FileAuditLog::new(&manifests_root).append(&PublishAuditRecord {
         audit_id: new_audit_id(),
         tenant_id: tenant_id.to_string(),
         layer_id: layer_id.to_string(),
@@ -603,6 +608,19 @@ pub fn rollback_layer_version(
         reason: Some(reason.to_string()),
         occurred_at: Utc::now(),
     })?;
+    // Sequence 4 US-OBS-05: central tenant-queryable audit record.
+    let _ = crate::obs::FileAuditTrail::new(data_dir).append(&crate::obs::AuditRecord {
+        event_type: crate::obs::audit_event::TILE_VERSION_ROLLED_BACK.to_string(),
+        event_id: new_event_id(),
+        tenant_id: tenant_id.to_string(),
+        layer_id: Some(layer_id.to_string()),
+        job_id: None,
+        tile_version: Some(target_version.to_string()),
+        actor: Some(actor.to_string()),
+        reason: Some(reason.to_string()),
+        succeeded: true,
+        occurred_at: Utc::now(),
+    });
     events.emit(PipelineEvent::VectorTileVersionRolledBack {
         event_id: new_event_id(),
         tenant_id: tenant_id.to_string(),
