@@ -77,21 +77,18 @@ fn resolve_request(
     x_raw: &str,
     y_raw: &str,
 ) -> Result<(LayerMetadata, TileCoord), ApiError> {
-    // 1. Tenant authorization (TRD §13): token-authenticated callers are
-    //    pinned to their own tenant prefix.
-    if let Some(tenant) = auth::authorized_tenant(state, headers) {
-        if tenant != tenant_id {
-            // Sequence 4 US-OBS-05: cross-tenant access is audited and
-            // counted (security-review signal).
-            obs::record_access_denied(
-                &state.data_dir,
-                &tenant,
-                &format!("tiles of layer {layer_id}"),
-            );
-            return Err(ApiError::forbidden(format!(
-                "tenant {tenant} cannot access tiles of tenant {tenant_id}"
-            )));
-        }
+    // 1. Tenant authorization (TRD §13 / Sequence 5 TI-01): token-
+    //    authenticated callers are pinned to their own tenant prefix.
+    //    Cross-tenant attempts are denied, audited, and counted centrally.
+    auth::check_tenant_access(state, headers, tenant_id, "TILES", layer_id)?;
+    // Sequence 5 TI-02/TI-05: reject traversal/separator payloads in ids.
+    if !vtile_pipeline::tenant::is_valid_tenant_id(tenant_id)
+        || !vtile_pipeline::tenant::is_valid_resource_id(layer_id)
+    {
+        return Err(ApiError::bad_request(
+            "INVALID_RESOURCE_ID",
+            "tenant or layer id contains invalid characters",
+        ));
     }
 
     // 2. Layer existence + ownership (TRD §8.5: 404 for invalid layer). The

@@ -45,7 +45,7 @@ pub async fn list_layers(
 
 /// Fetches one catalog entry (TRD §8.4). Unknown layers and cross-tenant
 /// access both surface as `404 LAYER_NOT_FOUND` so layer existence is not
-/// leaked across tenants.
+/// leaked across tenants (Sequence 5 TI-01 error policy).
 pub async fn get_layer(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -58,13 +58,22 @@ pub async fn get_layer(
             ApiError::not_found("LAYER_NOT_FOUND", format!("layer {layer_id} not found"))
         })?;
 
-    if let Some(tenant) = auth::authorized_tenant(&state, &headers) {
-        if tenant != layer.tenant_id {
-            return Err(ApiError::not_found(
-                "LAYER_NOT_FOUND",
-                format!("layer {layer_id} not found"),
-            ));
-        }
-    }
+    // Central ownership gate; cross-tenant attempts are denied + audited,
+    // then mapped to 404 (existence-hiding).
+    auth::check_tenant_access(&state, &headers, &layer.tenant_id, "LAYER", &layer_id)
+        .map_err(|_| {
+            ApiError::not_found("LAYER_NOT_FOUND", format!("layer {layer_id} not found"))
+        })?;
+    // Sequence 5 TI-06: ALLOW decision audit for control-plane reads.
+    vtile_pipeline::obs::record_access_decision(
+        &state.data_dir,
+        &layer.tenant_id,
+        auth::authorized_tenant(&state, &headers).as_deref(),
+        "LAYER",
+        &layer_id,
+        "READ",
+        "ALLOW",
+        None,
+    );
     Ok(Json(layer))
 }

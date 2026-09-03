@@ -26,3 +26,8 @@ clap = { workspace = true }
 [[bin]]
 name = "vtile-api"
 path = "src/main.rs"
+
+[dev-dependencies]
+# HTTP-level tenant isolation tests (Sequence 5 TI-05) drive the router
+# in-process via `ServiceExt::oneshot`.
+tower = { version = "0.4", features = ["util"] }

@@ -23,21 +23,21 @@ pub async fn get_job(
         .get(&job_id)?
         .ok_or_else(|| ApiError::not_found("JOB_NOT_FOUND", format!("job {job_id} not found")))?;
 
-    // Tenant isolation (TRD §13): when token auth is enabled, callers may
-    // only observe jobs belonging to their own tenant.
-    if let Some(tenant) = auth::authorized_tenant(&state, &headers) {
-        if tenant != job.tenant_id {
-            // Sequence 4 US-OBS-05: cross-tenant access is audited.
-            vtile_pipeline::record_access_denied(
-                &state.data_dir,
-                &tenant,
-                &format!("job {job_id}"),
-            );
-            return Err(ApiError::forbidden(format!(
-                "tenant {tenant} cannot access job {job_id}"
-            )));
-        }
-    }
+    // Tenant isolation (TRD §13 / Sequence 5 TI-01): when token auth is
+    // enabled, callers may only observe jobs belonging to their own tenant.
+    // Cross-tenant attempts are denied, audited, and counted centrally.
+    auth::check_tenant_access(&state, &headers, &job.tenant_id, "JOB", &job_id)?;
+    // Sequence 5 TI-06: ALLOW decision audit for control-plane reads.
+    vtile_pipeline::obs::record_access_decision(
+        &state.data_dir,
+        &job.tenant_id,
+        auth::authorized_tenant(&state, &headers).as_deref(),
+        "JOB",
+        &job_id,
+        "READ",
+        "ALLOW",
+        None,
+    );
 
     let outcome = job.outcome.as_ref();
     Ok(Json(JobResponse {

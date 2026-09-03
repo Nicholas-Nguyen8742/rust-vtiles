@@ -67,6 +67,35 @@ pub async fn create_upload(
     // before creating any job record (`INVALID_FILE_TYPE`).
     validate_file_type(&req.file_name, req.content_type.as_deref(), req.source_format)?;
 
+    // Sequence 5 TI-01/TI-02: tenant identity is server-side enforced.
+    // Validate the ids against the approved patterns (rejects traversal),
+    // then — when auth is enabled — require the body tenant to match the
+    // authenticated tenant claim. Client-supplied bodies are never trusted
+    // as the source of tenant identity.
+    if !vtile_pipeline::tenant::is_valid_tenant_id(&req.tenant_id) {
+        return Err(ApiError::bad_request(
+            "INVALID_TENANT_ID",
+            format!(
+                "tenantId {:?} does not match {}",
+                req.tenant_id,
+                vtile_pipeline::tenant::TENANT_ID_PATTERN
+            ),
+        ));
+    }
+    if !vtile_pipeline::tenant::is_valid_resource_id(&req.layer_id) {
+        return Err(ApiError::bad_request(
+            "INVALID_RESOURCE_ID",
+            format!("layerId {:?} contains invalid characters", req.layer_id),
+        ));
+    }
+    if !vtile_pipeline::tenant::is_valid_resource_id(&req.file_name) {
+        return Err(ApiError::bad_request(
+            "INVALID_RESOURCE_ID",
+            format!("fileName {:?} contains invalid characters", req.file_name),
+        ));
+    }
+    auth::check_tenant_access(&state, &headers, &req.tenant_id, "LAYER", &req.layer_id)?;
+
     let category = req.metadata.as_ref().and_then(|m| m.category);
     let zoom_range = req
         .requested_zoom_range
@@ -210,6 +239,10 @@ pub async fn create_upload(
         reason: None,
         succeeded: true,
         occurred_at: Utc::now(),
+        resource_type: Some("LAYER".to_string()),
+        resource_id: Some(req.layer_id.clone()),
+        action: Some("UPLOAD".to_string()),
+        decision: Some("ALLOW".to_string()),
     });
 
     tracing::info!(
@@ -279,6 +312,7 @@ fn resolve_existing_upload(
 /// starting duplicate runs.
 pub async fn upload_content(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(job_id): Path<String>,
     body: Bytes,
 ) -> Result<(StatusCode, Json<UploadAcceptedResponse>), ApiError> {
@@ -327,6 +361,12 @@ pub async fn upload_content(
             "upload body is empty",
         ));
     }
+
+    // Sequence 5 TI-03/TI-05: the content PUT (local analog of the
+    // presigned upload URL) is tenant-scoped — a signed URL minted for one
+    // tenant cannot be used to feed another tenant's job.
+    auth::check_tenant_access(&state, &headers, &job.tenant_id, "JOB", &job_id)?;
+    auth::audit_break_glass_if_present(&state, &headers, &job.tenant_id, "UPLOAD_CONTENT");
 
     // ── Sequence 1 US-03: duplicate event suppression ─────────────────────
     // The content PUT is the local event; the fingerprint mirrors
@@ -434,6 +474,10 @@ pub async fn upload_content(
         reason: None,
         succeeded: true,
         occurred_at: Utc::now(),
+        resource_type: Some("JOB".to_string()),
+        resource_id: Some(job.job_id.clone()),
+        action: Some("UPLOAD_CONTENT".to_string()),
+        decision: Some("ALLOW".to_string()),
     });
 
     // Assemble the run.

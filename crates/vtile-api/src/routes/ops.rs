@@ -44,16 +44,14 @@ pub async fn rollback_layer(
         .ok_or_else(|| {
             ApiError::not_found("LAYER_NOT_FOUND", format!("layer {layer_id} not found"))
         })?;
-    // Tenant isolation (TRD §13): cross-tenant rollbacks surface as 404 so
-    // layer existence is not leaked.
-    if let Some(tenant) = auth::authorized_tenant(&state, &headers) {
-        if tenant != layer.tenant_id {
-            return Err(ApiError::not_found(
-                "LAYER_NOT_FOUND",
-                format!("layer {layer_id} not found"),
-            ));
-        }
-    }
+    // Sequence 5 TI-01: cross-tenant rollback attempts are denied +
+    // audited centrally, then mapped to 404 (existence-hiding).
+    auth::check_tenant_access(&state, &headers, &layer.tenant_id, "LAYER", &layer_id)
+        .map_err(|_| {
+            ApiError::not_found("LAYER_NOT_FOUND", format!("layer {layer_id} not found"))
+        })?;
+    // Sequence 5 TI-04: break-glass operations are always audited.
+    auth::audit_break_glass_if_present(&state, &headers, &layer.tenant_id, "ROLLBACK");
 
     let target = req.target_tile_version.trim().to_string();
     let reason = req.reason.trim().to_string();
@@ -76,22 +74,10 @@ pub async fn rollback_layer(
         .map(|t| format!("api:{t}"))
         .unwrap_or_else(|| "api:operator".to_string());
 
-    let tiles_root = state
-        .data_dir
-        .join("tiles")
-        .join(&layer.tenant_id)
-        .join(&layer.layer_id);
-    let manifests_root = state
-        .data_dir
-        .join("manifests")
-        .join(&layer.tenant_id)
-        .join(&layer.layer_id);
-
     let record = rollback_layer_version(
         &layer.tenant_id,
         &layer.layer_id,
-        &tiles_root,
-        &manifests_root,
+        &state.data_dir,
         &target,
         &reason,
         &actor,
@@ -135,16 +121,11 @@ pub async fn replay_job(
         .jobs
         .get(&job_id)?
         .ok_or_else(|| ApiError::not_found("JOB_NOT_FOUND", format!("job {job_id} not found")))?;
-    // Tenant isolation (TRD §13): callers may only replay their own jobs.
-    if let Some(tenant) = auth::authorized_tenant(&state, &headers) {
-        if tenant != job.tenant_id {
-            // Sequence 4 US-OBS-05: cross-tenant replay attempts are audited.
-            obs::record_access_denied(&state.data_dir, &tenant, &format!("job {job_id}"));
-            return Err(ApiError::forbidden(format!(
-                "tenant {tenant} cannot replay job {job_id}"
-            )));
-        }
-    }
+    // Sequence 5 TI-01/TI-04: replay is tenant-scoped — cross-tenant
+    // attempts are denied, audited, and counted centrally.
+    auth::check_tenant_access(&state, &headers, &job.tenant_id, "JOB", &job_id)?;
+    // Sequence 5 TI-04: break-glass operations are always audited.
+    auth::audit_break_glass_if_present(&state, &headers, &job.tenant_id, "REPLAY");
 
     let reason = req.reason.trim().to_string();
     if reason.is_empty() {
@@ -239,6 +220,10 @@ pub async fn replay_job(
         reason: Some(reason.clone()),
         succeeded: true,
         occurred_at: chrono::Utc::now(),
+        resource_type: Some("JOB".to_string()),
+        resource_id: Some(replay_job_id.clone()),
+        action: Some("REPLAY".to_string()),
+        decision: Some("ALLOW".to_string()),
     });
 
     let deps = JobDeps {
@@ -327,6 +312,15 @@ pub async fn query_audit(
     headers: HeaderMap,
     Query(q): Query<AuditQuery>,
 ) -> Result<Json<Vec<obs::AuditRecord>>, ApiError> {
+    // Sequence 5 TI-02: reject malformed tenant scopes before any read.
+    if let Some(t) = &q.tenant_id {
+        if !vtile_pipeline::tenant::is_valid_tenant_id(t) {
+            return Err(ApiError::bad_request(
+                "INVALID_TENANT_ID",
+                format!("tenantId {t:?} does not match the approved pattern"),
+            ));
+        }
+    }
     let tenant = auth::authorized_tenant(&state, &headers).or(q.tenant_id);
     let trail = obs::FileAuditTrail::new(&state.data_dir);
     let records = trail.query(
