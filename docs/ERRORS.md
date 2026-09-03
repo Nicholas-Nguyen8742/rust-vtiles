@@ -91,6 +91,10 @@ These never reach the pipeline; they enforce the TRD §8/§13 contracts.
 | `LAYER_NOT_PUBLISHED` | 404 | tiles | Layer exists but has no manifest (never published) |
 | `ZOOM_OUT_OF_RANGE` | 422 | tiles | `z` outside the layer's published range or beyond the tile grid (TRD §8.5) |
 | `INVALID_TILE_COORDINATES` | 400 / 422 | tiles | Non-numeric `z/x/y`, or `x`/`y` outside the zoom's grid |
+| `MISSING_TENANT_CLAIM` | 401 | tenant-scoped routes (auth on) | Authenticated request with no tenant claim header (Sequence 5 TI-01) |
+| `INVALID_TENANT_CLAIM` | 401 | tenant-scoped routes (auth on) | Tenant claim fails the approved pattern (traversal, bad chars, bad length) (Sequence 5 TI-01) |
+| `INVALID_TENANT_ID` | 400 | `POST /ingest/uploads`, `GET /ops/audit` | Body/query tenant id fails the approved pattern (Sequence 5 TI-02) |
+| `INVALID_RESOURCE_ID` | 400 | uploads, tiles | layerId/jobId/fileName contains separators or traversal patterns (Sequence 5 TI-02/TI-05) |
 
 The tile endpoint additionally returns **`204 No Content` for empty tiles** —
 not an error, per TRD §8.5/US-03, so map clients do not treat voids as
@@ -114,6 +118,30 @@ semantics in [`IDEMPOTENCY.md`](IDEMPOTENCY.md).
 | `StateConflict` | Conditional transition rejected: stale expected status or illegal edge | Inspect `stateVersion` history; usually a redelivery race — retry |
 | `LeaseConflict` | Job owned by another worker's active lease | Back off; the owning worker finishes or the lease expires (900 s) |
 | `JobAlreadyActive` | Replay attempted while the job is still processing (`JOB_ALREADY_ACTIVE`) | Wait for the terminal state, then replay if still needed |
+| `TenantMismatch` | Worker-side tenant guard: malformed tenant id, traversal layer id, or a source URI carrying another tenant's prefix (`TENANT_MISMATCH`) | Fix the job's tenant/layer/source bindings; never a data-side retry |
+
+## Tenant isolation errors (Sequence 5)
+
+Cross-tenant access is denied at the authorization middleware and every
+ownership gate, audited under the CALLER's tenant, and counted
+(`tenant_authorization_denied_total`). Error policy (TI-01):
+
+- `401` — missing/invalid authentication, or missing/malformed tenant claim.
+- `403` — authenticated but not the owning tenant (jobs, tiles, replay,
+  upload-content).
+- `404` — non-owned layers/rollback (existence-hiding, reduces enumeration).
+
+| Code | HTTP | Where | Meaning |
+|---|---:|---|---|
+| `MISSING_TENANT_CLAIM` | 401 | any tenant-scoped route (auth on) | No tenant claim header on an authenticated request |
+| `INVALID_TENANT_CLAIM` | 401 | any tenant-scoped route (auth on) | Claim fails `^[a-z0-9-_]{3,64}$` (traversal/case/length) |
+| `INVALID_TENANT_ID` | 400 | uploads, audit query | Request-body tenant id fails validation |
+| `INVALID_RESOURCE_ID` | 400 | uploads, tiles | Resource id contains separators/traversal |
+| `FORBIDDEN` | 403 | jobs, tiles, replay, upload-content | Cross-tenant access attempt |
+| `TENANT_MISMATCH` | 500 | worker (run_job) | Storage/event tenant does not match the job record |
+
+Full control map, verification matrix, and break-glass workflow:
+[`TENANT_ISOLATION.md`](TENANT_ISOLATION.md).
 
 ## Quarantine and replay
 

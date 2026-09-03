@@ -27,6 +27,7 @@ pub mod sink_local;
 #[cfg(feature = "aws")]
 pub mod sink_s3;
 pub mod store;
+pub mod tenant;
 
 pub use error::{PipelineError, PipelineResult};
 pub use idempotency::{
@@ -56,3 +57,7 @@ pub use recovery::{
 };
 pub use replay::{replay_job, ReplayOptions, ReplayOutcome};
 pub use store::Lease;
+pub use tenant::{
+    is_valid_resource_id, is_valid_tenant_id, tenant_alignment_holds, TenantContext,
+    TENANT_ID_PATTERN,
+};

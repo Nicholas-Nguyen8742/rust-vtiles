@@ -5,6 +5,14 @@
 # that converts them to 204 (US-03) is deployed separately with the edge
 # function code and is referenced here via `lambda_function_association`
 # once published.
+#
+# Sequence 5 TI-03 — private tenant tile delivery: the MVP distribution is
+# open (MVP tenants are trusted app origins). For confidential CRE layers,
+# switch to CloudFront signed URLs (5–15 min TTL) or signed cookies
+# (session-aligned) minted by the API for the requesting tenant only; the
+# tenant prefix in the key path keeps cache entries tenant-scoped. A
+# Lambda@Edge viewer-request authorization hook is the alternative when the
+# token model supports edge validation.
 
 resource "aws_cloudfront_origin_access_control" "tiles" {
   name                              = "${local.name_prefix}-tiles"
@@ -94,22 +102,41 @@ resource "aws_cloudfront_distribution" "tiles" {
 }
 
 # OAC read access on the tile bucket.
+#
+# Sequence 5 TI-03: tile delivery is private — the bucket is only reachable
+# through CloudFront OAC (no public access), and tenant isolation rides on
+# the tenant-prefixed key layout plus the API/edge authorization layer.
+# The CloudFront cache key includes the full tenant path, so cache entries
+# can never cross tenants.
 resource "aws_s3_bucket_policy" "tiles" {
   bucket = aws_s3_bucket.tiles.id
 
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [{
-      Sid       = "AllowCloudFrontServicePrincipal"
-      Effect    = "Allow"
-      Principal = { Service = "cloudfront.amazonaws.com" }
-      Action    = "s3:GetObject"
-      Resource  = "${aws_s3_bucket.tiles.arn}/tiles/*"
-      Condition = {
-        StringEquals = {
-          "AWS:SourceArn" = aws_cloudfront_distribution.tiles.arn
+    Statement = [
+      {
+        Sid       = "AllowCloudFrontServicePrincipal"
+        Effect    = "Allow"
+        Principal = { Service = "cloudfront.amazonaws.com" }
+        Action    = "s3:GetObject"
+        Resource  = "${aws_s3_bucket.tiles.arn}/tiles/*"
+        Condition = {
+          StringEquals = {
+            "AWS:SourceArn" = aws_cloudfront_distribution.tiles.arn
+          }
         }
-      }
-    }]
+      },
+      {
+        # Sequence 5 TI-03: deny all non-TLS access.
+        Sid       = "DenyInsecureTransport"
+        Effect    = "Deny"
+        Principal = "*"
+        Action    = "s3:*"
+        Resource  = [aws_s3_bucket.tiles.arn, "${aws_s3_bucket.tiles.arn}/*"]
+        Condition = {
+          Bool = { "aws:SecureTransport" = "false" }
+        }
+      },
+    ]
   })
 }

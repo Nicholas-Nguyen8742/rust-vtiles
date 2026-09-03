@@ -60,6 +60,12 @@ pub enum PipelineError {
     #[error("replay not allowed: {0}")]
     ReplayNotAllowed(String),
 
+    /// Sequence 5 TI-02: tenant identity is malformed, or the tenant
+    /// embedded in a storage path/event does not match the job's tenant.
+    /// Runs fail rather than touch another tenant's objects.
+    #[error("tenant mismatch: {0}")]
+    TenantMismatch(String),
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 

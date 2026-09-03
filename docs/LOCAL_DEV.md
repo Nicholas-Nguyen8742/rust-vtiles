@@ -74,6 +74,7 @@ data/                                  # local mirror of TRD §6 S3 prefixes
     latest.json                        # atomic live pointer
     audit.jsonl                        # append-only publish/rollback audit
   dlq/{tenantId}/{jobId}.json          # dead-lettered jobs (Sequence 3 US-01)
+  audit/audit.jsonl                    # cross-cutting tenant-scoped audit trail (Sequence 4)
   quarantine/{tenantId}/{jobId}/
     input.bin                          # original upload bytes
     error-report.json                  # ErrorReport (code, stage, message, ...)
@@ -229,6 +230,37 @@ blocked from replay with `REPLAY_NOT_ALLOWED` — fix the source and submit a
 new upload. `UNKNOWN_CRS` replays with `ASSUME_WGS84=1` (the TRD §10 user
 confirmation). Successful replays clear the DLQ entry; failures return to it.
 
+## Tenant isolation (Sequence 5)
+
+Tenant identity comes from the authenticated principal, never from request
+bodies. When `--auth-token` is set, every tenant-scoped route
+(`/api/v1/*`, `/tiles/*`) requires a valid `X-Tenant-Id` claim matching
+`^[a-z0-9-_]{3,64}$`; cross-tenant access is denied (`403`/`404`), audited
+under the caller, and counted. Upload bodies, content PUTs, jobs, tiles,
+replay, and rollback all pass through the central ownership gate.
+
+```bash
+make isolation-tests   # cross-tenant negative suite (API + pipeline)
+make audit TENANT=tenant-acme            # tenant-scoped audit trail
+```
+
+Full control map, verification matrix, and break-glass workflow:
+[`TENANT_ISOLATION.md`](TENANT_ISOLATION.md).
+
+## Observability endpoints (Sequence 4)
+
+```bash
+make dashboard   # GET /internal/dashboard — job states, DLQ depth, layer freshness, triggered alerts
+make alerts      # GET /internal/alerts — alert catalog evaluated against current telemetry
+make audit TENANT=tenant-acme [EVENT_TYPE=layer.published]  # GET /api/v1/ops/audit
+make metrics     # GET /internal/metrics — all telemetry families
+```
+
+Stage logs (UPLOAD_REQUESTED … PUBLISH_COMPLETED, JOB_FAILED, JOB_RETRIED,
+JOB_SENT_TO_DLQ) are emitted as structured JSON with `traceId`/`jobId`
+correlation — see [`OBSERVABILITY.md`](OBSERVABILITY.md) for the schema,
+metric inventory, and alert matrix.
+
 ## CLI reference (`vtile`)
 
 The same binary is the Fargate entrypoint in production (TRD §11 Decision 2).
@@ -279,6 +311,7 @@ Environment:
 | Variable | Default | Purpose |
 |---|---|---|
 | `RUST_LOG` | `vtile_api=info,vtile_pipeline=info` (API), `info` (CLI) | `tracing` filter |
+| `VTILE_ENVIRONMENT` | `local` | `environment` label in stage logs and metrics |
 | `API_BASE` | `http://127.0.0.1:8080` | scripts/seed.sh, scripts/smoke.sh |
 | `TENANT` | `tenant-acme` | scripts/seed.sh, scripts/smoke.sh |
 | `AWS_ENDPOINT_URL`, `AWS_*` | — | only with `--features aws` (S3 sink) |
@@ -303,6 +336,14 @@ snapshot (Sequence 1 US-06); `make metrics` wraps it.
   capture, quarantine enrichment, eligibility/limit enforcement, and replay
   audit all run locally; SQS redrive + EventBridge alerting are the
   production transports (`docs/RECOVERY.md`).
+- **Observability is real.** Structured stage logs, dimensioned metrics,
+  alert evaluation, and the tenant-scoped audit trail run in-process;
+  CloudWatch Logs/Metrics/Alarms + X-Ray are the production transports
+  (`docs/OBSERVABILITY.md`, `terraform/cloudwatch.tf`).
+- **Tenant isolation is enforced.** Bearer token + tenant claim validation,
+  central ownership gates on every resource path, worker-side tenant
+  alignment, and an automated cross-tenant negative suite
+  (`docs/TENANT_ISOLATION.md`).
 - **No real queue.** The PUT handler starts processing in-process; the TRD
   "job start < 30 s" NFR is trivially met locally.
 - **File stores instead of DynamoDB.** Single-file catalog (`catalog.json`) —

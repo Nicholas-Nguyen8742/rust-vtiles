@@ -564,14 +564,11 @@ fn rollback(
     if reason.trim().is_empty() {
         anyhow::bail!("--reason is required for rollback (auditability)");
     }
-    let tiles_root = data_dir.join("tiles").join(&tenant).join(&layer);
-    let manifests_root = data_dir.join("manifests").join(&tenant).join(&layer);
     let emitter = LoggingEventEmitter;
     let record = vtile_pipeline::rollback_layer_version(
         &tenant,
         &layer,
-        &tiles_root,
-        &manifests_root,
+        &data_dir,
         &target_version,
         &reason,
         &requested_by,

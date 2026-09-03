@@ -1,4 +1,10 @@
 # KMS key for SSE-KMS object encryption (TRD §13 data protection).
+#
+# Sequence 5 TI-03: objects are tenant-prefixed and the tenant is recorded
+# in job/layer metadata; access is restricted through IAM + this key policy.
+# Higher-sensitivity tenants can graduate to per-tenant keys or aliases
+# (`alias/{prefix}-pipeline-{tenantId}`) with key policies limited to that
+# tenant's roles — add those keys here when required.
 
 resource "aws_kms_key" "pipeline" {
   description             = "SSE-KMS key for ${local.name_prefix} vector tile pipeline objects"

@@ -95,3 +95,23 @@ resource "aws_s3_bucket_lifecycle_configuration" "tiles" {
     }
   }
 }
+
+# Sequence 5 TI-03: TLS-only access on the staging bucket (raw uploads and
+# normalized intermediates — client-confidential CRE data).
+resource "aws_s3_bucket_policy" "staging_secure_transport" {
+  bucket = aws_s3_bucket.staging.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "DenyInsecureTransport"
+      Effect    = "Deny"
+      Principal = "*"
+      Action    = "s3:*"
+      Resource  = [aws_s3_bucket.staging.arn, "${aws_s3_bucket.staging.arn}/*"]
+      Condition = {
+        Bool = { "aws:SecureTransport" = "false" }
+      }
+    }]
+  })
+}

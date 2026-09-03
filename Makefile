@@ -21,13 +21,17 @@ LAYER          ?=
 TARGET_VERSION ?=
 # Sequence 3 US-06: scope the DLQ listing (empty = all tenants).
 DLQ_TENANT     ?=
+# Sequence 4: audit query filters.
+EVENT_TYPE     ?=
+LIMIT          ?= 50
 
 RELEASE := target/release
 
 .DEFAULT_GOAL := help
 
 .PHONY: help build fixtures setup setup-docker run-local run-local-docker \
-        seed job-status smoke replay-job rollback-layer dlq metrics test clean distclean
+        seed job-status smoke replay-job rollback-layer dlq metrics dashboard \
+        alerts audit isolation-tests test clean distclean
 
 help: ## Show available targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
@@ -79,6 +83,21 @@ replay-job: ## Replay a job: make replay-job JOB_ID=job_... [ASSUME_WGS84=1] [CR
 
 metrics: ## Idempotency telemetry snapshot from the running API
 	curl -s "http://$(HOST):$(PORT)/internal/metrics"
+
+dashboard: ## Operations dashboard (job states, DLQ depth, layer freshness, alerts)
+	curl -s "http://$(HOST):$(PORT)/internal/dashboard"
+
+alerts: ## Alert catalog evaluated against current telemetry
+	curl -s "http://$(HOST):$(PORT)/internal/alerts"
+
+audit: ## Query the audit trail: make audit TENANT=t [EVENT_TYPE=layer.published]
+	@test -n "$(TENANT)" || { echo "usage: make audit TENANT=<tenant> [EVENT_TYPE=<event.type>]"; exit 2; }
+	curl -s "http://$(HOST):$(PORT)/api/v1/ops/audit?tenantId=$(TENANT)$(if $(EVENT_TYPE),&eventType=$(EVENT_TYPE),)$(if $(LIMIT),&limit=$(LIMIT),)"
+
+isolation-tests: ## Sequence 5 cross-tenant negative test suite (API + pipeline)
+	cargo test -p vtile-api --test api_tenant_isolation
+	cargo test -p vtile-pipeline --test tenant_isolation
+	cargo test -p vtile-pipeline --lib tenant::
 
 dlq: ## List dead-lettered jobs: make dlq [DLQ_TENANT=tenant-acme]
 	@if [ -x "$(RELEASE)/vtile" ]; then \

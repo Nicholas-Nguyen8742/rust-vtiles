@@ -136,6 +136,28 @@ pub fn run_job(input: &RunJobInput, deps: &JobDeps) -> PipelineResult<JobOutcome
         }
     }
 
+    // Sequence 5 TI-02: validate tenant identity and tenant alignment
+    // before any storage access — a worker must never read or write another
+    // tenant's objects.
+    if !crate::tenant::is_valid_tenant_id(&job.tenant_id) {
+        return Err(PipelineError::TenantMismatch(format!(
+            "malformed tenant id {:?} on job {}",
+            job.tenant_id, job.job_id
+        )));
+    }
+    if !crate::tenant::is_valid_resource_id(&job.layer_id) {
+        return Err(PipelineError::TenantMismatch(format!(
+            "malformed layer id {:?} on job {}",
+            job.layer_id, job.job_id
+        )));
+    }
+    if !crate::tenant::tenant_alignment_holds(&job.tenant_id, &job.source_uri) {
+        return Err(PipelineError::TenantMismatch(format!(
+            "job {} source URI {:?} does not carry tenant {:?} prefix",
+            job.job_id, job.source_uri, job.tenant_id
+        )));
+    }
+
     // Sequence 1 US-04: worker lease.
     let worker_id = format!("vtile-worker-{}", std::process::id());
     let lease = deps
@@ -514,6 +536,10 @@ fn run_job_inner(
         reason: None,
         succeeded: true,
         occurred_at: Utc::now(),
+        resource_type: Some("LAYER".to_string()),
+        resource_id: Some(job.layer_id.clone()),
+        action: Some("PUBLISH".to_string()),
+        decision: Some("ALLOW".to_string()),
     });
 
     // ── 11. Update catalog ────────────────────────────────────────────────
@@ -642,6 +668,7 @@ pub fn error_classification(err: &PipelineError) -> (String, String) {
         PipelineError::PromotionConflict(_) => "PROMOTION_CONFLICT",
         PipelineError::RollbackFailed(_) => "ROLLBACK_FAILED",
         PipelineError::ReplayNotAllowed(_) => "REPLAY_NOT_ALLOWED",
+        PipelineError::TenantMismatch(_) => "TENANT_MISMATCH",
         _ => "PIPELINE_ERROR",
     };
     (code.to_string(), err.to_string())

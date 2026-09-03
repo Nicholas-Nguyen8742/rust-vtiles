@@ -202,6 +202,8 @@ production cutover checklist.
 | Idempotent job processing (identity, dedupe, leases, replay guardrails, telemetry) | `vtile-pipeline/src/{idempotency,store}.rs`, `docs/IDEMPOTENCY.md` |
 | Atomic publishing (candidate staging, checksums, conditional promotion, rollback, audit) | `vtile-pipeline/src/publish.rs`, `docs/PUBLISHING.md` |
 | DLQ & replay (retry policy, classification, quarantine enrichment, replay guardrails, telemetry) | `vtile-pipeline/src/recovery.rs`, `docs/RECOVERY.md` |
+| §15 observability (structured logs, correlation, metrics, dashboards, alerts, audit) | `vtile-pipeline/src/obs.rs`, `docs/OBSERVABILITY.md`, `terraform/cloudwatch.tf` |
+| Tenant isolation (token tenant claims, ownership gates, worker alignment, negative tests, break-glass audit) | `vtile-pipeline/src/tenant.rs`, `vtile-api/src/auth.rs`, `docs/TENANT_ISOLATION.md` |
 | Local dev loop (make targets, fixtures, smoke) | `Makefile`, `scripts/`, `docs/LOCAL_DEV.md` |
 
 ## Documentation
@@ -211,6 +213,8 @@ production cutover checklist.
 - [`docs/IDEMPOTENCY.md`](docs/IDEMPOTENCY.md) — idempotent job processing: identity keys, duplicate-event suppression, leases, replay guardrails, telemetry
 - [`docs/PUBLISHING.md`](docs/PUBLISHING.md) — atomic publishing: candidate staging, completeness verification, conditional promotion, rollback, audit trail
 - [`docs/RECOVERY.md`](docs/RECOVERY.md) — DLQ and replay: retry policy, error classes, replay eligibility, quarantine reports, observability
+- [`docs/OBSERVABILITY.md`](docs/OBSERVABILITY.md) — observability: structured log schema, metric inventory, dashboards, alert matrix, tracing, tenant audit
+- [`docs/TENANT_ISOLATION.md`](docs/TENANT_ISOLATION.md) — tenant isolation: control map, identity model, private tile delivery, break-glass, cross-tenant test matrix
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — component map, workflow, storage layout, production cutover
 - [`docs/MVT.md`](docs/MVT.md) — the MVT v2 wire format and how the encoder works
 - [`docs/PRECISION.md`](docs/PRECISION.md) — 7-decimal requirement vs. MVT quantization per zoom (read this before trusting tile geometry for measurement)

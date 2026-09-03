@@ -620,6 +620,10 @@ pub fn rollback_layer_version(
         reason: Some(reason.to_string()),
         succeeded: true,
         occurred_at: Utc::now(),
+        resource_type: Some("LAYER".to_string()),
+        resource_id: Some(layer_id.to_string()),
+        action: Some("ROLLBACK".to_string()),
+        decision: Some("ALLOW".to_string()),
     });
     events.emit(PipelineEvent::VectorTileVersionRolledBack {
         event_id: new_event_id(),

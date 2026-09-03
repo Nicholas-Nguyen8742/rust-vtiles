@@ -372,8 +372,7 @@ fn rollback_restores_previous_version_and_is_audited() {
     let record = rollback_layer_version(
         TENANT,
         LAYER,
-        &paths.tiles_root,
-        &paths.manifests_root,
+        &root,
         &v1,
         "Parcel boundaries misaligned after vendor refresh",
         "sre:oncall",
@@ -426,7 +425,7 @@ fn rollback_is_idempotent_and_rejects_invalid_targets() {
     // Rolling back to the already-current version is a no-op.
     let before = FileAuditLog::new(&paths.manifests_root).entries().unwrap().len();
     let record = rollback_layer_version(
-        TENANT, LAYER, &paths.tiles_root, &paths.manifests_root,
+        TENANT, LAYER, &root,
         &v1, "noop", "sre:oncall", &noop,
     )
     .unwrap();
@@ -440,7 +439,7 @@ fn rollback_is_idempotent_and_rejects_invalid_targets() {
 
     // Unknown target version → rejected.
     let err = rollback_layer_version(
-        TENANT, LAYER, &paths.tiles_root, &paths.manifests_root,
+        TENANT, LAYER, &root,
         "no-such-version", "x", "sre:oncall", &noop,
     )
     .unwrap_err();
@@ -450,7 +449,7 @@ fn rollback_is_idempotent_and_rejects_invalid_targets() {
     // Layer with no publication at all → rejected.
     let empty = temp_root("rb-empty");
     let err = rollback_layer_version(
-        TENANT, LAYER, &empty.join("tiles"), &empty.join("manifests"),
+        TENANT, LAYER, &empty,
         &v1, "x", "sre:oncall", &noop,
     )
     .unwrap_err();

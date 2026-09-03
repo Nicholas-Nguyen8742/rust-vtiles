@@ -206,6 +206,11 @@ pub mod metric {
     pub const TENANT_AUTHORIZATION_DENIED: &str = "tenant_authorization_denied_total";
     pub const CROSS_TENANT_ACCESS_ATTEMPT: &str = "cross_tenant_access_attempt_total";
     pub const REPLAY_OPERATIONS: &str = "replay_operation_total";
+    /// Sequence 5 TI-06: authorization failures of any kind (monitoring for
+    /// spike alerts).
+    pub const AUTHORIZATION_FAILURE: &str = "authorization_failure_count";
+    /// Sequence 5 TI-06: privileged/break-glass access events.
+    pub const PRIVILEGED_ACCESS: &str = "privileged_access_count";
 }
 
 /// Canonical series key: `name{k1=v1,k2=v2}` with sorted labels.
@@ -559,6 +564,29 @@ pub fn alert_rules() -> Vec<AlertRule> {
             },
             runbook: "docs/PUBLISHING.md#rollback-us-ap-05".into(),
         },
+        AlertRule {
+            name: "CrossTenantDenialSpike".into(),
+            severity: AlertSeverity::P2,
+            description:
+                "More than 5 cross-tenant authorization denials (Sequence 5 TI-06)"
+                    .into(),
+            condition: AlertCondition::GreaterThan {
+                metric: metric::TENANT_AUTHORIZATION_DENIED.into(),
+                threshold: 5.0,
+            },
+            runbook: "docs/TENANT_ISOLATION.md#monitoring-and-compliance".into(),
+        },
+        AlertRule {
+            name: "PrivilegedAccessOccurred".into(),
+            severity: AlertSeverity::P2,
+            description: "Any break-glass / privileged access event (Sequence 5 TI-06)"
+                .into(),
+            condition: AlertCondition::GreaterThan {
+                metric: metric::PRIVILEGED_ACCESS.into(),
+                threshold: 0.0,
+            },
+            runbook: "docs/TENANT_ISOLATION.md#break-glass-access".into(),
+        },
     ]
 }
 
@@ -651,6 +679,12 @@ pub mod audit_event {
     pub const JOB_REPLAYED: &str = "job.replayed";
     pub const TENANT_ACCESS_DENIED: &str = "tenant.access.denied";
     pub const MANIFEST_UPDATED: &str = "manifest.updated";
+    /// Sequence 5 TI-06: every authorization decision (ALLOW and DENY) on
+    /// control-plane operations.
+    pub const TENANT_ACCESS_DECISION: &str = "tenant.access.decision";
+    /// Sequence 5 TI-04: break-glass (privileged cross-tenant) access —
+    /// always audited and alerted.
+    pub const TENANT_BREAK_GLASS: &str = "tenant.break_glass";
 }
 
 /// One audit record: who did what to which resource, when, and whether it
@@ -673,6 +707,16 @@ pub struct AuditRecord {
     pub reason: Option<String>,
     pub succeeded: bool,
     pub occurred_at: DateTime<Utc>,
+    /// Sequence 5 TI-06 decision-audit fields (`tenant.access.decision`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    /// `ALLOW` or `DENY`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<String>,
 }
 
 /// Append-only JSONL audit trail at `data/audit/audit.jsonl` (local mirror
@@ -751,28 +795,85 @@ impl FileAuditTrail {
 /// Best-effort helper for the cross-tenant denial audit path (US-OBS-05):
 /// counts the event and appends the record without failing the request.
 pub fn record_access_denied(data_dir: &Path, caller_tenant: &str, resource: &str) {
-    ObsMetrics::global().inc(
-        metric::TENANT_AUTHORIZATION_DENIED,
-        &[("tenantId", caller_tenant)],
+    record_access_decision(
+        data_dir,
+        caller_tenant,
+        None,
+        "RESOURCE",
+        resource,
+        "ACCESS",
+        "DENY",
+        Some("TENANT_MISMATCH"),
     );
-    ObsMetrics::global().inc(
-        metric::CROSS_TENANT_ACCESS_ATTEMPT,
-        &[("tenantId", caller_tenant)],
-    );
+}
+
+/// Sequence 5 TI-06: append a `tenant.access.decision` audit record (ALLOW
+/// or DENY) and count authorization failures. Best-effort: audit write
+/// failures are logged, never propagated into the request path.
+pub fn record_access_decision(
+    data_dir: &Path,
+    tenant_id: &str,
+    principal: Option<&str>,
+    resource_type: &str,
+    resource_id: &str,
+    action: &str,
+    decision: &str,
+    reason: Option<&str>,
+) {
+    let metrics = ObsMetrics::global();
+    if decision == "DENY" {
+        metrics.inc(metric::AUTHORIZATION_FAILURE, &[("tenantId", tenant_id)]);
+    }
     let record = AuditRecord {
-        event_type: audit_event::TENANT_ACCESS_DENIED.to_string(),
+        event_type: audit_event::TENANT_ACCESS_DECISION.to_string(),
         event_id: new_event_id(),
-        tenant_id: caller_tenant.to_string(),
+        tenant_id: tenant_id.to_string(),
         layer_id: None,
         job_id: None,
         tile_version: None,
-        actor: Some(format!("tenant:{caller_tenant}")),
-        reason: Some(format!("cross-tenant access denied: {resource}")),
-        succeeded: false,
+        actor: principal.map(str::to_string),
+        reason: reason.map(str::to_string),
+        succeeded: decision == "ALLOW",
         occurred_at: Utc::now(),
+        resource_type: Some(resource_type.to_string()),
+        resource_id: Some(resource_id.to_string()),
+        action: Some(action.to_string()),
+        decision: Some(decision.to_string()),
     };
     if let Err(e) = FileAuditTrail::new(data_dir).append(&record) {
-        tracing::error!(error = %e, "failed to write audit record");
+        tracing::error!(error = %e, "failed to write access decision audit record");
+    }
+}
+
+/// Sequence 5 TI-04: record a break-glass (privileged) access. Local
+/// emulation is audit-only — production grants time-bound elevated roles via
+/// IAM and requires an incident reference.
+pub fn record_break_glass(
+    data_dir: &Path,
+    tenant_id: &str,
+    principal: Option<&str>,
+    reference: &str,
+    action: &str,
+) {
+    ObsMetrics::global().inc(metric::PRIVILEGED_ACCESS, &[("tenantId", tenant_id)]);
+    let record = AuditRecord {
+        event_type: audit_event::TENANT_BREAK_GLASS.to_string(),
+        event_id: new_event_id(),
+        tenant_id: tenant_id.to_string(),
+        layer_id: None,
+        job_id: None,
+        tile_version: None,
+        actor: principal.map(str::to_string),
+        reason: Some(format!("break-glass reference: {reference}")),
+        succeeded: true,
+        occurred_at: Utc::now(),
+        resource_type: None,
+        resource_id: None,
+        action: Some(action.to_string()),
+        decision: Some("ALLOW".to_string()),
+    };
+    if let Err(e) = FileAuditTrail::new(data_dir).append(&record) {
+        tracing::error!(error = %e, "failed to write break-glass audit record");
     }
 }
 
